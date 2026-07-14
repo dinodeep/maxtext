@@ -1061,6 +1061,10 @@ class TransformerEngineQuantization(Quantization):
             return tex.CollectiveOpSet.create(tex.CollectiveOp.ALL_GATHER)
           elif mesh_axes[0] == "mlp" and mesh_axes[-1] == "embed":
             return tex.CollectiveOpSet.create(tex.CollectiveOp.REDUCE_SCATTER)
+          elif mesh_axes[0] == "embed" and mesh_axes[-1].startswith("kv"):
+            return tex.CollectiveOpSet.create(tex.CollectiveOp.ALL_GATHER)
+          elif mesh_axes[0] == "heads" and mesh_axes[-1] == "embed":
+            return tex.CollectiveOpSet.create(tex.CollectiveOp.REDUCE_SCATTER)
 
         return tex.noop_collective_op_set
 
