@@ -527,6 +527,7 @@ logical_axis_rules: [
                       ['activation_heads', ['tensor', 'tensor_sequence', 'autoregressive']],
                       ['activation_kv_heads', ['tensor', 'tensor_sequence']],
                       ['activation_length_attn', ['context']],
+                      ['activation_norm_length_attn', ['tensor_sequence', 'context']],
                       ['activation_q_length', ['context']],
                       ['activation_kv_length', []],
                       ['activation_embed_attn', ['tensor']],
