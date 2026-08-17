@@ -1020,6 +1020,7 @@ class TransformerEngineQuantization(Quantization):
     from transformer_engine.common import recipe  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
 
     RECIPES = {
+        "te_no_quant": lambda: None,
         "te_fp8_delayedscaling": recipe.DelayedScaling,
         "te_fp8_currentscaling": recipe.Float8CurrentScaling,
         "te_mxfp8": recipe.MXFP8BlockScaling,
@@ -1153,7 +1154,150 @@ class TransformerEngineQuantization(Quantization):
 
     return self._wrap(te_dot_general, "dot_general")
 
-  def einsum(self, dtype: DType = jnp.float32):
+  def einsum(self, *args, **kwargs):
     """Placeholder for einsum implementation in subclasses."""
     # quant.einsum is only required for MoE or for inference with KVCache.
     raise ValueError("Einsum is not yet supported for TransformerEngine quantization.")
+
+  def get_gmm_align_size(self, te_gmm_quantization_recipe_name: str):
+    """Get the alignment size for GMM based on the TransformerEngine quantization recipe."""
+    ALIGN_SIZES_BY_RECIPE_NAME = {
+        "te_no_quant": 8,  # BF16 alignment requirement for cuBLASLt kernel which is 16B or 8 BF16 elements
+        "te_mxfp8": 128,  # MXFP8BlockScaling requirement for TE grouped quant kernel and cuBLASLt MXFP8 grouped GEMM
+    }
+    if te_gmm_quantization_recipe_name not in ALIGN_SIZES_BY_RECIPE_NAME:
+      raise ValueError(f"Invalid TransformerEngine GMM quantization recipe name: {te_gmm_quantization_recipe_name}")
+    return ALIGN_SIZES_BY_RECIPE_NAME[te_gmm_quantization_recipe_name]
+
+  def get_gmm_quantizer_set(self, te_gmm_quantization_recipe_name: str, n_groups: int):
+    """Create a TransformerEngine quantizer set for direct grouped GEMM calls."""
+    import jax.numpy as jnp  # pylint: disable=import-outside-toplevel
+    from transformer_engine.jax.quantize import QuantizerFactory, ScalingMode  # pylint: disable=import-outside-toplevel
+
+    if te_gmm_quantization_recipe_name == "te_no_quant":
+      return QuantizerFactory.create_set(scaling_mode=ScalingMode.NO_SCALING, n_groups=n_groups)
+    if te_gmm_quantization_recipe_name != "te_mxfp8":
+      raise ValueError(f"Invalid TransformerEngine GMM quantization recipe name: {te_gmm_quantization_recipe_name}")
+    return QuantizerFactory.create_set(
+        scaling_mode=ScalingMode.MXFP8_1D_SCALING,
+        fwd_dtype=jnp.float8_e4m3fn,
+        bwd_dtype=jnp.float8_e4m3fn,
+        is_2x2x=True,
+        n_groups=n_groups,
+    )
+
+  def get_moe_block_quantizer_set(
+      self,
+      te_gmm_quantization_recipe_name: str,
+      n_token_groups: int,
+      n_expert_groups: int,
+  ):
+    """Create a TransformerEngine quantizer set for TE MoEBlock grouped GEMMs."""
+    import jax.numpy as jnp  # pylint: disable=import-outside-toplevel
+    from transformer_engine.jax.quantize import (  # pylint: disable=import-outside-toplevel
+        QuantizerFactory,
+        QuantizerSet,
+        ScalingMode,
+    )
+
+    if te_gmm_quantization_recipe_name == "te_no_quant":
+      return QuantizerFactory.create_set(scaling_mode=ScalingMode.NO_SCALING, is_2x2x=False)
+    if te_gmm_quantization_recipe_name != "te_mxfp8":
+      raise ValueError(f"Invalid TransformerEngine GMM quantization recipe name: {te_gmm_quantization_recipe_name}")
+    if n_token_groups <= 0 or n_expert_groups <= 0:
+      raise ValueError(
+          "TE MoEBlock quantizer group counts must be positive, got "
+          f"n_token_groups={n_token_groups}, n_expert_groups={n_expert_groups}."
+      )
+
+    token_quantizer_set = QuantizerFactory.create_set(
+        scaling_mode=ScalingMode.MXFP8_1D_SCALING,
+        fwd_dtype=jnp.float8_e4m3fn,
+        bwd_dtype=jnp.float8_e4m3fn,
+        is_2x2x=True,
+        n_groups=n_token_groups,
+    )
+    expert_quantizer_set = QuantizerFactory.create_set(
+        scaling_mode=ScalingMode.MXFP8_1D_SCALING,
+        fwd_dtype=jnp.float8_e4m3fn,
+        bwd_dtype=jnp.float8_e4m3fn,
+        is_2x2x=True,
+        n_groups=n_expert_groups,
+    )
+    return QuantizerSet(
+        x=token_quantizer_set.x,
+        kernel=expert_quantizer_set.kernel,
+        dgrad=token_quantizer_set.dgrad,
+    )
+
+  def get_moe_block_quantizer_sets(
+      self,
+      te_gmm_quantization_recipe_name: str,
+      n_token_groups: int,
+      n_expert_groups: int,
+  ):
+    """Create independent FC1 and FC2 quantizer sets for TE's MoE custom VJP."""
+    return tuple(
+        self.get_moe_block_quantizer_set(
+            te_gmm_quantization_recipe_name,
+            n_token_groups=n_token_groups,
+            n_expert_groups=n_expert_groups,
+        )
+        for _ in range(2)
+    )
+
+  def validate_moe_block_quantization_shapes(
+      self,
+      te_gmm_quantization_recipe_name: str,
+      hidden_dim: int,
+      intermediate_dim: int,
+      fsdp_size: int,
+      shard_exp_on_fsdp: bool = False,
+  ) -> None:
+    """Validate the local TE MoEBlock grouped-quantization dimensions.
+    When FSDP shards experts, the grouped-GEMM K dimension remains the full
+    hidden dimension. Otherwise FSDP shards that K dimension directly.
+    """
+    if te_gmm_quantization_recipe_name != "te_mxfp8":
+      return
+    if fsdp_size <= 0:
+      raise ValueError(f"MoE fsdp_size must be positive, got {fsdp_size}.")
+    if not shard_exp_on_fsdp and hidden_dim % fsdp_size != 0:
+      raise ValueError(f"MoE hidden_dim={hidden_dim} must be divisible by fsdp_size={fsdp_size} for TE MXFP8.")
+
+    alignment = self.get_gmm_align_size(te_gmm_quantization_recipe_name)
+    local_hidden_dim = hidden_dim if shard_exp_on_fsdp else hidden_dim // fsdp_size
+    hidden_dim_name = "hidden/K (FSDP shards experts)" if shard_exp_on_fsdp else "local hidden/K (FSDP shards hidden)"
+    for name, size in (
+        (hidden_dim_name, local_hidden_dim),
+        ("intermediate", intermediate_dim),
+    ):
+      if size % alignment != 0:
+        raise ValueError(
+            f"TE MoEBlock MXFP8 requires the {name} dimension to be {alignment}-aligned, "
+            f"got {size} (hidden_dim={hidden_dim}, fsdp_size={fsdp_size}, "
+            f"intermediate_dim={intermediate_dim})."
+        )
+
+  def gmm(self, inputs, kernel, tiling, group_sizes, expert_assignments, te_gmm_quantization_recipe_name):
+    """Grouped GEMM"""
+    import transformer_engine.jax.flax as te_flax  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
+
+    # Currently only BF16 is supported for TE GMM v2, so we don't use the quantization recipe here yet.
+    the_recipe = TransformerEngineQuantization._get_recipe(te_gmm_quantization_recipe_name)
+    # the_recipe = None
+    original_input_ndim = inputs.ndim
+    if original_input_ndim == 2:
+      inputs = inputs.reshape(1, *inputs.shape)
+
+    output = te_flax.make_grouped_dense_cls(
+        quantization_recipe=the_recipe,
+        quantization_checkpoint_name="quantization",
+    )(
+        inputs,
+        kernel,
+        group_sizes,
+    )
+    if original_input_ndim == 2:
+      output = output.reshape(*output.shape[1:])
+    return output

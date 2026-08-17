@@ -1211,7 +1211,13 @@ def validate_ring_of_experts_parallelism(raw_keys):
 def validate_shard_expert_on_fsdp(raw_keys):
   if raw_keys["shard_exp_on_fsdp"] and raw_keys["num_experts"] % raw_keys["ici_fsdp_parallelism"] != 0:
     raise ValueError("shard_exp_on_fsdp requires num_experts is divisiable by ici_fsdp_parallelism.")
-  if raw_keys["shard_exp_on_fsdp"] and (using_tensor_parallelism(raw_keys) or using_expert_parallelism(raw_keys)):
+  # TE's fused MoEBlock supports sharding experts on FSDP while using EP.  The
+  # legacy routed-MoE path does not, so retain this guard for that path only.
+  if (
+      raw_keys["shard_exp_on_fsdp"]
+      and not raw_keys["te_moe_block"]
+      and (using_tensor_parallelism(raw_keys) or using_expert_parallelism(raw_keys))
+  ):
     raise ValueError("shard_exp_on_fsdp requires ici_expert_parallelism = 1 and ici_tensor_parallelism = 1.")
 
 

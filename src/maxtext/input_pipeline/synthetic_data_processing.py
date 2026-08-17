@@ -111,6 +111,8 @@ class SyntheticDataIterator:
     return self
 
   def __next__(self):
+    if self.config.hardware == "gpu_multiprocess":
+      return SyntheticDataIterator.raw_generate_synthetic_data(self.config, self.data)
     with self.mesh:
       return self.data_generator(self.config, self.data)  # pylint: disable=not-callable
 

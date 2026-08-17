@@ -95,11 +95,20 @@ class QuantizationType(str, Enum):
   FP8_NANO_V2 = "fp8_nanoo"
   FP8_GPU = "fp8_gpu"
   FP8_FULL = "fp8_full"
+  TE_NO_QUANT = "te_no_quant"
   TE_FP8_DS = "te_fp8_delayedscaling"
   TE_FP8_CS = "te_fp8_currentscaling"
   TE_MXFP8 = "te_mxfp8"
   TE_NVFP4 = "te_nvfp4"
   TE_NVFP4_NO_RHT = "te_nvfp4_no_rht"
+
+
+class TEGroupedGemmQuantizationType(str, Enum):
+  """Supported quantization schemes for TE grouped GEMM in MoE layers."""
+
+  EMPTY = ""  # Invalid when te_use_gmm is true, an explicit precision must be specified.
+  TE_NO_QUANT = "te_no_quant"  # Default precision, e.g. BF16, without quantization
+  TE_MXFP8 = "te_mxfp8"
 
 
 class TeCommGemmOverlapPolicy(str, Enum):
@@ -883,6 +892,42 @@ class MoEGeneral(BaseModel):
   use_ring_of_experts: bool = Field(
       False,
       description="Whether to use Ring of Experts for sparse matmul expert parallelism.",
+  )
+  te_router_and_permutation_impl: bool = Field(
+      False,
+      description="Whether to use TransformerEngine fused router and permutation kernels for MoE routing and token dispatch/combine.",
+  )
+  moe_permutation_group_align_size: int = Field(
+      128,
+      description="Alignment size for MoE permutation group padding (MT and TE paths). Set to 0 to disable.",
+  )
+  te_use_gmm: bool = Field(
+      False,
+      description="Whether to use TransformerEngine Grouped GEMM kernels for matmuls in MoE layers.",
+  )
+  te_moe_block: bool = Field(
+      False,
+      description="Whether to use TransformerEngine's fused EP MoEBlock for routing, dispatch, grouped GEMM, and combine.",
+  )
+  te_ep_receive_capacity_fraction: float = Field(
+      1.0,
+      gt=0.0,
+      le=1.0,
+      description=(
+          "TE EP receive capacity as a fraction of the aligned dropless worst case. "
+          "A value of 1.0 is dropless; smaller values may overflow."
+      ),
+  )
+  te_ep_overflow_check_every_n_steps: PositiveInt = Field(
+      20,
+      description=(
+          "Number of training steps buffered between host-side TE EP receive-capacity overflow checks. "
+          "Overflowing steps still skip their optimizer update immediately on device."
+      ),
+  )
+  te_gmm_quantization: None | TEGroupedGemmQuantizationType = Field(
+      TEGroupedGemmQuantizationType.EMPTY,
+      description="Quantization mode for TE GMM matmuls, must be specified when te_use_gmm is true.",
   )
   moe_dispatch_no_expert_sharding: bool = Field(
       False,
@@ -3817,6 +3862,16 @@ class MaxTextConfig(
           and self.decoder_block not in (DecoderBlockType.DEEPSEEK, DecoderBlockType.DEEPSEEK4)
       ):
         raise ValueError("Loss-free load balancing is only supported for the DeepSeek decoder block.")
+      if self.te_router_and_permutation_impl and not self.sparse_matmul:
+        raise ValueError("te_router_and_permutation_impl=True requires sparse_matmul=True.")
+      if self.te_use_gmm and not self.sparse_matmul:
+        raise ValueError("te_use_gmm=True requires sparse_matmul=True.")
+      if self.te_moe_block and not self.sparse_matmul:
+        raise ValueError("te_moe_block=True requires sparse_matmul=True.")
+      if self.te_moe_block and self.routed_bias_update_rate > 0.0:
+        raise ValueError("te_moe_block=True does not currently support routed_bias_update_rate > 0.")
+      if self.te_use_gmm and self.te_gmm_quantization == TEGroupedGemmQuantizationType.EMPTY:
+        raise ValueError("te_gmm_quantization must be specified when te_use_gmm is True.")
       if not self.pure_nnx and self.routed_bias and self.decoder_block == DecoderBlockType.DEEPSEEK4:
         raise ValueError(
             "Auxiliary-loss-free routed bias for DeepSeek V4 is only supported in pure NNX mode. "

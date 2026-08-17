@@ -22,6 +22,7 @@ from typing import Any, Sequence
 import datetime
 import functools
 import os
+import numpy as np
 
 from absl import app
 
@@ -388,6 +389,19 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
             mtp_moe_bias_updates = []
           mtp_moe_bias_updates.append(val)
 
+  te_moe_capacity_overflow = jnp.asarray(False)
+  te_moe_max_total_recv_tokens = jnp.asarray(0, dtype=jnp.int32)
+  te_moe_recv_capacity_per_rank = jnp.asarray(0, dtype=jnp.int32)
+  if config.te_moe_block:
+    overflow_values = maxtext_utils.collect_intermediates_by_suffix(intermediate_outputs, "te_moe_capacity_overflow")
+    total_recv_values = maxtext_utils.collect_intermediates_by_suffix(intermediate_outputs, "te_moe_total_recv_tokens")
+    capacity_values = maxtext_utils.collect_intermediates_by_suffix(intermediate_outputs, "te_moe_recv_capacity_per_rank")
+    if not overflow_values or not total_recv_values or not capacity_values:
+      raise ValueError("te_moe_block=True did not produce TE MoE receive-capacity intermediates.")
+    te_moe_capacity_overflow = jnp.any(jnp.concatenate(overflow_values))
+    te_moe_max_total_recv_tokens = jnp.max(jnp.concatenate(total_recv_values))
+    te_moe_recv_capacity_per_rank = jnp.min(jnp.concatenate(capacity_values))
+
   # Add the model's primary output to the intermediates dict so it can be used
   # by the acceptance rate calculation in eval_step.
   if not is_train and config.mtp_eval_target_module > 0:
@@ -403,6 +417,9 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
       "moe_bias_updates": moe_bias_updates,
       "mtp_moe_bias_updates": mtp_moe_bias_updates,
       "mtp_loss": mtp_loss,
+      "te_moe_capacity_overflow": te_moe_capacity_overflow,
+      "te_moe_max_total_recv_tokens": te_moe_max_total_recv_tokens,
+      "te_moe_recv_capacity_per_rank": te_moe_recv_capacity_per_rank,
       "batch_stats": (intermediate_outputs.get("batch_stats", None) if hasattr(intermediate_outputs, "get") else None),
   }
   return loss, aux
@@ -550,143 +567,165 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   moe_bias_updates = aux.get("moe_bias_updates")
   mtp_moe_bias_updates = aux.get("mtp_moe_bias_updates")
   mtp_loss = aux.get("mtp_loss", 0.0)
+  te_moe_capacity_overflow = aux.get("te_moe_capacity_overflow", jnp.asarray(False))
+  te_moe_max_total_recv_tokens = aux.get("te_moe_max_total_recv_tokens", jnp.asarray(0, dtype=jnp.int32))
+  te_moe_recv_capacity_per_rank = aux.get("te_moe_recv_capacity_per_rank", jnp.asarray(0, dtype=jnp.int32))
   new_opt_state = None
   bias_metrics = {}
 
-  if isinstance(model, nn.Module):
-    if config.gradient_clipping_threshold > 0:
-      grads = maxtext_utils.apply_gradient_clipping(raw_grads, state, config.gradient_clipping_threshold)
-    else:
-      grads = raw_grads
-    if config.optimizer_memory_host_offload:
-      state = state.replace(
-          opt_state=jax.device_put(
-              state.opt_state,
-              jax.tree_util.tree_map(
-                  lambda x: x.with_memory_kind(kind="device"),
-                  state_mesh_shardings.opt_state,
-              ),
-          )
-      )
-    # Move all parameters to device before optimizer update
-    if config.parameter_memory_host_offload:
-      max_logging.log("\nMoving all parameters to device before optimizer update")
+  def apply_training_updates(state):
+    """Apply every mutable training-state update for a valid MoE step."""
 
-      def move(path, value):
-        max_logging.log(f"train.py: Moving f{path} to device")
-        return value.with_memory_kind(kind="device")
-
-      state = state.replace(
-          params=jax.device_put(
-              state.params,
-              jax.tree_util.tree_map_with_path(move, state_mesh_shardings.params),
-          )
-      )
-    # Re-wrap grads to match state.params structure if it's a dict of collections
-    # (when weight_sparsity is enabled, params has both 'params' and 'batch_stats' keys).
-    sparsity_enabled = config.weight_sparsity_n and config.weight_sparsity_m
-    if sparsity_enabled:
-      full_grads = {"params": grads}
-      if "batch_stats" in state.params:
-        batch_stats_grads = jax.tree_util.tree_map(jnp.zeros_like, state.params.get("batch_stats", {}))
-        full_grads["batch_stats"] = batch_stats_grads
-      full_grads = max_utils.unbox_logicallypartioned(full_grads)
-    else:
-      full_grads = grads
-
-    if getattr(config, "skip_step_on_spikes", False):
-      grad_norm = max_utils.l2norm_pytree(grads)
-      # TrainState.apply_gradients doesn't pass **kwargs to tx.update, so we unpack it manually.
-      updates, new_opt_state = state.tx.update(grads, state.opt_state, state.params, loss=loss, grad_norm=grad_norm)
-      new_params = optax.apply_updates(state.params, updates)
-
-      new_state = state.replace(
-          step=state.step + 1,
-          params=new_params,
-          opt_state=new_opt_state,
-      )
-    else:
-      new_state = state.apply_gradients(grads=full_grads)
-
-    # Apply updates for Auxiliary-Loss-Free load balancing for DeepSeek family
-    if config.routed_bias and config.routed_bias_update_rate > 0.0 and moe_bias_updates is not None:
-      target_path = ("params", "decoder", "moe_layers", "DeepSeekMoeBlock_0", "MoeBlock_0", "gate", "bias")
-      # Updates the shape to be aligned with state.
-      moe_bias_updates = jnp.array(moe_bias_updates[0]).transpose()
-      new_state = maxtext_utils.update_state_param(new_state, target_path, moe_bias_updates)
-  else:
-    if config.gradient_clipping_threshold > 0:
-      grads = maxtext_utils.apply_gradient_clipping(raw_grads, None, config.gradient_clipping_threshold)
-    else:
-      grads = raw_grads
-    if config.optimizer_memory_host_offload:
-      # state.optimizer is an NNX Optimizer module; state_mesh_shardings.optimizer
-      # is an NNX State. Use nnx.state() to get a compatible State for device_put.
-      device_opt_shardings = jax.tree_util.tree_map_with_path(
-          maxtext_utils_nnx.move_memory_to_device,
-          state_mesh_shardings.optimizer,
-          is_leaf=lambda x: isinstance(x, NamedSharding),
-      )
-      opt_state = nnx.state(state.optimizer)
-      new_opt_state = jax.device_put(opt_state, device_opt_shardings)
-      nnx.update(state.optimizer, new_opt_state)
-    if config.skip_step_on_spikes:
-      # The skip-step optimizer is a GradientTransformationExtraArgs that reads
-      # loss/grad_norm to decide whether to zero the update on a spike. nnx
-      # Optimizer.update forwards these kwargs to tx.update.
-      grad_norm = max_utils.l2norm_pytree(grads)
-      state.apply_gradients(grads, loss=loss, grad_norm=grad_norm)
-    else:
-      state.apply_gradients(grads)
-    new_state = state
-
-    # Apply updates for Auxiliary-Loss-Free load balancing for DeepSeek family
-    # pylint: disable=too-many-nested-blocks
-    if config.routed_bias and config.routed_bias_update_rate > 0.0:
-      if getattr(config, "model_name", "").startswith("deepseek4"):
-        max_logging.log("DeepSeek V4: Applying auxiliary-loss-free routing bias via pure NNX MoEBiasVar.")
-        flat_intermediates = traverse_util.flatten_dict(aux.get("intermediate_outputs", {}))
-        for path, update in flat_intermediates.items():
-          if path[-1] != "moe_bias_updates":
-            continue
-          target = new_state.model
-          prefix = path[1:-1] if path[0] == "intermediates" else path[:-1]
-          for key in prefix:
-            if hasattr(target, key):
-              target = getattr(target, key)
-            elif isinstance(target, dict) and key in target:
-              target = target[key]
-            else:
-              target = None
-              break
-          if target is None:
-            continue
-          for _, node in nnx.iter_graph(target):
-            if type(node).__name__ == "GateLogit" and hasattr(node, "bias") and node.bias is not None:
-              update_val = update[0] if isinstance(update, (tuple, list)) else update
-              name_prefix = "-".join(map(str, prefix))
-              if getattr(config, "log_moe_bias_norms", False):
-                bias_metrics[f"learning/moe_bias_before_norm_{name_prefix}"] = jnp.linalg.norm(node.bias.value)
-              node.bias.value = node.bias.value + jnp.array(update_val)
-              if getattr(config, "log_moe_bias_norms", False):
-                bias_metrics[f"learning/moe_bias_update_norm_{name_prefix}"] = jnp.linalg.norm(jnp.array(update_val))
+    if isinstance(model, nn.Module):
+      if config.gradient_clipping_threshold > 0:
+        grads = maxtext_utils.apply_gradient_clipping(raw_grads, state, config.gradient_clipping_threshold)
       else:
-        # 1. Update main decoder scanned MoE layers.
-        # The update from the scan is (num_moe_layers, num_experts) and must be transposed.
-        decoder_layer = getattr(new_state.model.decoder, "moe_layers", new_state.model.decoder)
-        decoder_bias = _find_gate_bias(decoder_layer)
-        if decoder_bias is not None:
-          decoder_bias.value = decoder_bias.value + jnp.array(moe_bias_updates[0]).transpose()
+        grads = raw_grads
+      if config.optimizer_memory_host_offload:
+        state = state.replace(
+            opt_state=jax.device_put(
+                state.opt_state,
+                jax.tree_util.tree_map(
+                    lambda x: x.with_memory_kind(kind="device"),
+                    state_mesh_shardings.opt_state,
+                ),
+            )
+        )
+      # Move all parameters to device before optimizer update
+      if config.parameter_memory_host_offload:
+        max_logging.log("\nMoving all parameters to device before optimizer update")
 
-        # 2. Update auxiliary MTP MoE layers (if enabled).
-        # Unlike the main decoder, each MTP layer is an individual un-scanned layer
-        # with a 1D bias of shape (num_experts,).
-        if mtp_moe_bias_updates is not None and hasattr(new_state.model, "mtp_block"):
-          for i, update in enumerate(mtp_moe_bias_updates):
-            mtp_layer = getattr(new_state.model.mtp_block, f"mtp_layer_{i + 1}", None)
-            mtp_bias = _find_gate_bias(mtp_layer)
-            if mtp_bias is not None:
-              mtp_bias.value = mtp_bias.value + jnp.array(update)
+        def move(path, value):
+          max_logging.log(f"train.py: Moving f{path} to device")
+          return value.with_memory_kind(kind="device")
+
+        state = state.replace(
+            params=jax.device_put(
+                state.params,
+                jax.tree_util.tree_map_with_path(move, state_mesh_shardings.params),
+            )
+        )
+      # Re-wrap grads to match state.params structure if it's a dict of collections
+      # (when weight_sparsity is enabled, params has both 'params' and 'batch_stats' keys).
+      sparsity_enabled = config.weight_sparsity_n and config.weight_sparsity_m
+      if sparsity_enabled:
+        full_grads = {"params": grads}
+        if "batch_stats" in state.params:
+          batch_stats_grads = jax.tree_util.tree_map(jnp.zeros_like, state.params.get("batch_stats", {}))
+          full_grads["batch_stats"] = batch_stats_grads
+        full_grads = max_utils.unbox_logicallypartioned(full_grads)
+      else:
+        full_grads = grads
+
+      if getattr(config, "skip_step_on_spikes", False):
+        grad_norm = max_utils.l2norm_pytree(grads)
+        # TrainState.apply_gradients doesn't pass **kwargs to tx.update, so we unpack it manually.
+        updates, new_opt_state = state.tx.update(grads, state.opt_state, state.params, loss=loss, grad_norm=grad_norm)
+        new_params = optax.apply_updates(state.params, updates)
+
+        new_state = state.replace(
+            step=state.step + 1,
+            params=new_params,
+            opt_state=new_opt_state,
+        )
+      else:
+        new_state = state.apply_gradients(grads=full_grads)
+
+      # Apply updates for Auxiliary-Loss-Free load balancing for DeepSeek family
+      if config.routed_bias and config.routed_bias_update_rate > 0.0 and moe_bias_updates is not None:
+        target_path = ("params", "decoder", "moe_layers", "DeepSeekMoeBlock_0", "MoeBlock_0", "gate", "bias")
+        # Updates the shape to be aligned with state.
+        moe_bias_updates = jnp.array(moe_bias_updates[0]).transpose()
+        new_state = maxtext_utils.update_state_param(new_state, target_path, moe_bias_updates)
+
+      new_state = qk_clip_utils.apply_qk_clip(new_state, intermediate_outputs, config)
+    else:
+      if config.gradient_clipping_threshold > 0:
+        grads = maxtext_utils.apply_gradient_clipping(raw_grads, None, config.gradient_clipping_threshold)
+      else:
+        grads = raw_grads
+      if config.optimizer_memory_host_offload:
+        # state.optimizer is an NNX Optimizer module; state_mesh_shardings.optimizer
+        # is an NNX State. Use nnx.state() to get a compatible State for device_put.
+        device_opt_shardings = jax.tree_util.tree_map_with_path(
+            maxtext_utils_nnx.move_memory_to_device,
+            state_mesh_shardings.optimizer,
+            is_leaf=lambda x: isinstance(x, NamedSharding),
+        )
+        opt_state = nnx.state(state.optimizer)
+        new_opt_state = jax.device_put(opt_state, device_opt_shardings)
+        nnx.update(state.optimizer, new_opt_state)
+      if config.skip_step_on_spikes:
+        # The skip-step optimizer is a GradientTransformationExtraArgs that reads
+        # loss/grad_norm to decide whether to zero the update on a spike. nnx
+        # Optimizer.update forwards these kwargs to tx.update.
+        grad_norm = max_utils.l2norm_pytree(grads)
+        state.apply_gradients(grads, loss=loss, grad_norm=grad_norm)
+      else:
+        state.apply_gradients(grads)
+      new_state = state
+
+      # Apply updates for Auxiliary-Loss-Free load balancing for DeepSeek family
+      # pylint: disable=too-many-nested-blocks
+      if config.routed_bias and config.routed_bias_update_rate > 0.0:
+        if getattr(config, "model_name", "").startswith("deepseek4"):
+          max_logging.log("DeepSeek V4: Applying auxiliary-loss-free routing bias via pure NNX MoEBiasVar.")
+          flat_intermediates = traverse_util.flatten_dict(aux.get("intermediate_outputs", {}))
+          for path, update in flat_intermediates.items():
+            if path[-1] != "moe_bias_updates":
+              continue
+            target = new_state.model
+            prefix = path[1:-1] if path[0] == "intermediates" else path[:-1]
+            for key in prefix:
+              if hasattr(target, key):
+                target = getattr(target, key)
+              elif isinstance(target, dict) and key in target:
+                target = target[key]
+              else:
+                target = None
+                break
+            if target is None:
+              continue
+            for _, node in nnx.iter_graph(target):
+              if type(node).__name__ == "GateLogit" and hasattr(node, "bias") and node.bias is not None:
+                update_val = update[0] if isinstance(update, (tuple, list)) else update
+                name_prefix = "-".join(map(str, prefix))
+                if getattr(config, "log_moe_bias_norms", False):
+                  bias_metrics[f"learning/moe_bias_before_norm_{name_prefix}"] = jnp.linalg.norm(node.bias.value)
+                node.bias.value = node.bias.value + jnp.array(update_val)
+                if getattr(config, "log_moe_bias_norms", False):
+                  bias_metrics[f"learning/moe_bias_update_norm_{name_prefix}"] = jnp.linalg.norm(jnp.array(update_val))
+        else:
+          # 1. Update main decoder scanned MoE layers.
+          # The update from the scan is (num_moe_layers, num_experts) and must be transposed.
+          decoder_layer = getattr(new_state.model.decoder, "moe_layers", new_state.model.decoder)
+          decoder_bias = _find_gate_bias(decoder_layer)
+          if decoder_bias is not None:
+            decoder_bias.value = decoder_bias.value + jnp.array(moe_bias_updates[0]).transpose()
+
+          # 2. Update auxiliary MTP MoE layers (if enabled).
+          # Unlike the main decoder, each MTP layer is an individual un-scanned layer
+          # with a 1D bias of shape (num_experts,).
+          if mtp_moe_bias_updates is not None and hasattr(new_state.model, "mtp_block"):
+            for i, update in enumerate(mtp_moe_bias_updates):
+              mtp_layer = getattr(new_state.model.mtp_block, f"mtp_layer_{i + 1}", None)
+              mtp_bias = _find_gate_bias(mtp_layer)
+              if mtp_bias is not None:
+                mtp_bias.value = mtp_bias.value + jnp.array(update)
+
+      new_state = qk_clip_utils.apply_qk_clip_nnx(new_state, intermediate_outputs, config)
+
+    return new_state
+
+  # Dropped expert tokens invalidate both the forward result and its gradients.
+  # The replicated condition prevents parameters, optimizer/FP8 state, auxiliary
+  # updates, and the step counter from changing on an overflowing step.
+  new_state = jax.lax.cond(
+      te_moe_capacity_overflow,
+      lambda current_state: current_state,
+      apply_training_updates,
+      state,
+  )
 
   lm_loss = xent_sum / (total_weights + EPS)
   scalar_metrics = {
@@ -698,20 +737,18 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       "learning/indexer_loss": indexer_loss,
       "learning/mtp_loss": mtp_loss,
       "learning/total_weights": total_weights,
+      "learning/te_moe_capacity_overflow": te_moe_capacity_overflow.astype(jnp.int32),
+      "learning/te_moe_max_total_recv_tokens": te_moe_max_total_recv_tokens,
+      "learning/te_moe_recv_capacity_per_rank": te_moe_recv_capacity_per_rank,
   }
   scalar_metrics.update(bias_metrics)
   if config.use_qk_clip:
-    if isinstance(model, nn.Module):
-      new_state = qk_clip_utils.apply_qk_clip(new_state, intermediate_outputs, config)
-    else:
-      new_state = qk_clip_utils.apply_qk_clip_nnx(new_state, intermediate_outputs, config)
-
     global_max_logit = qk_clip_utils.calculate_max_logit_metric(intermediate_outputs)
     if global_max_logit is not None:
       scalar_metrics["learning/max_logits"] = global_max_logit
 
   if not config.optimizer_memory_host_offload:
-    scalar_metrics["learning/grad_norm"] = max_utils.l2norm_pytree(grads)
+    # scalar_metrics["learning/grad_norm"] = max_utils.l2norm_pytree(grads)
     scalar_metrics["learning/raw_grad_norm"] = max_utils.l2norm_pytree(raw_grads)
     if isinstance(model, nn.Module):
       scalar_metrics["learning/param_norm"] = max_utils.l2norm_pytree(new_state.params)
@@ -785,6 +822,9 @@ def eval_step(model, config, state, data, dropout_rng=None):
   return metrics
 
 
+te_moe_overflow_window = []
+
+
 def training_loop_iteration(
     jax_device_state: dict[str, Any],
     python_vars: dict[str, Any],
@@ -849,6 +889,40 @@ def training_loop_iteration(
         if shard_optimizer_over_data and isinstance(model, nn.Module):
           state = sharding.maybe_shard_with_name(state, state_mesh_shardings, shard_mode)
         state, metrics = p_train_step(state, example_batch, *step_rng_args)
+
+  te_moe_overflow_window.append(
+      (
+          int(step),
+          metrics["scalar"]["learning/te_moe_capacity_overflow"],
+          metrics["scalar"]["learning/te_moe_max_total_recv_tokens"],
+          metrics["scalar"]["learning/te_moe_recv_capacity_per_rank"],
+      )
+  )
+  check_overflow = len(te_moe_overflow_window) == config.te_ep_overflow_check_every_n_steps or step == config.steps - 1
+  if check_overflow:
+    checked_window = jax.device_get(tuple(te_moe_overflow_window))
+    overflowing_steps = [entry for entry in checked_window if bool(np.asarray(entry[1]))]
+    te_moe_overflow_window.clear()
+  else:
+    overflowing_steps = []
+
+  if overflowing_steps:
+    overflow_step = overflowing_steps[0][0]
+    observed = max(int(np.asarray(entry[2])) for entry in overflowing_steps)
+    capacity = min(int(np.asarray(entry[3])) for entry in overflowing_steps)
+    prof.deactivate()
+    message = (
+        "TE MoE receive capacity overflow at training step "
+        f"{overflow_step} (detected at the {config.te_ep_overflow_check_every_n_steps}-step "
+        f"check ending at step {step}): "
+        f"observed padded receive demand {observed} exceeds "
+        f"recv_capacity_per_rank {capacity} "
+        f"(te_ep_receive_capacity_fraction={config.te_ep_receive_capacity_fraction}). "
+        "The optimizer update was skipped; increase te_ep_receive_capacity_fraction "
+        "up to 1.0 for worst-case dropless capacity."
+    )
+    max_logging.error(message)
+    raise RuntimeError(message)
 
   step_time_delta = datetime.datetime.now() - last_step_completion
   last_step_completion = datetime.datetime.now()
