@@ -445,6 +445,7 @@ class RoutedMoE(nnx.Module):
     self.quant = quant
     self.rngs = rngs
     self.is_hash_routing = is_hash_routing
+    self.has_routed_bias = self.config.routed_bias and not self.is_hash_routing
 
     # DeepSeek V4 Hash Routing
     if self.is_hash_routing:
@@ -507,7 +508,7 @@ class RoutedMoE(nnx.Module):
         quant=self.quant,
         kernel_init=self.kernel_init,
         kernel_axes=self.kernel_axes,
-        use_bias=self.config.routed_bias and not self.is_hash_routing,
+        use_bias=self.has_routed_bias,
         # tpu-inference applies the score function in the fused_moe_gmm kernel,
         # so we don't apply it here to avoid redundant computation.
         # See https://github.com/vllm-project/tpu-inference/blob/main/tpu_inference/layers/common/fused_moe_gmm.py#L58.
@@ -3183,7 +3184,7 @@ class RoutedMoE(nnx.Module):
       raise ValueError("te_moe_block=True requires TransformerEngine quantization.")
 
     expert_bias = None
-    if self.config.routed_bias:
+    if self.has_routed_bias:
       expert_bias = jnp.asarray(self.gate.bias[...], jnp.float32)
 
     fsdp_size = self.mesh.shape.get("fsdp", 1)
