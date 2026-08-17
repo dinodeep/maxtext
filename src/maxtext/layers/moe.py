@@ -3175,7 +3175,7 @@ class RoutedMoE(nnx.Module):
       raise ValueError("te_moe_block=True does not support use_random_routing=True.")
     if self.config.decoder_block == ctypes.DecoderBlockType.LLAMA4:
       raise ValueError("te_moe_block=True does not currently support Llama4 routing semantics.")
-    if self.get_tensor_parallelism_size() > 1 or self.get_tensor_transpose_parallelism_size() > 1:
+    if self.get_tensor_parallelism_size() > 1:
       raise ValueError("te_moe_block=True currently requires tensor parallelism size 1.")
     if not self.config.te_gmm_quantization:
       raise ValueError("te_gmm_quantization must be specified when te_moe_block=True.")
