@@ -435,6 +435,19 @@ def _find_gate_bias(module: nnx.Module | None) -> nnx.Variable | None:
   return None
 
 
+def _align_nnx_state_to_template(template_state: nnx.State, state: nnx.State) -> nnx.State:
+  """Return state restricted to template paths so JIT I/O matches init shardings.
+
+  Forward can materialize lazy module-level ``rngs`` subtrees that are absent from
+  ``state_mesh_shardings``. Drop those extra keys while keeping template paths
+  (e.g. ``decoder.dropout``) even when they hold RngState.
+  """
+  template_flat = traverse_util.flatten_dict(template_state.to_pure_dict())
+  state_flat = traverse_util.flatten_dict(state.to_pure_dict())
+  aligned_flat = {path: state_flat[path] if path in state_flat else template_flat[path] for path in template_flat}
+  return nnx.State(traverse_util.unflatten_dict(aligned_flat))
+
+
 def train_step(model, config, state_mesh_shardings, params_shardings, state, data, dropout_rng=None):
   """Training step for both Linen and NNX models.
 
@@ -453,6 +466,7 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   """
   # pylint: disable=too-many-nested-blocks
   # --- Per-path initialization ---
+  input_pure_state = state if not isinstance(model, nn.Module) else None
   if isinstance(model, nn.Module):
     params = state.params
     loss_model, loss_params, loss_rng = model, params, dropout_rng
@@ -540,7 +554,10 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       def diff_wrapper(curr_params, custom_params, rest, config, data):
         local_model = nnx.merge(model_graphdef, curr_params, custom_params, rest, copy=True)
         loss, aux = loss_fn(local_model, config, data, None, None, is_train=True)
-        non_param_rest = nnx.state(local_model, nnx.Not(nnx.Any(nnx.Param, nnx.Intermediate, nnx.RngState)))
+        non_param_rest = _align_nnx_state_to_template(
+            rest,
+            nnx.state(local_model, nnx.Not(nnx.Any(nnx.Param, nnx.Intermediate))),
+        )
         return loss, (aux, non_param_rest)
 
       grad_func = jax.value_and_grad(diff_wrapper, argnums=(0, 1), has_aux=True)
@@ -564,8 +581,6 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   moe_lb_loss = aux["moe_lb_loss"]
   indexer_loss = aux.get("indexer_loss", 0.0)
   z_loss = aux.get("z_loss", 0.0)
-  moe_bias_updates = aux.get("moe_bias_updates")
-  mtp_moe_bias_updates = aux.get("mtp_moe_bias_updates")
   mtp_loss = aux.get("mtp_loss", 0.0)
   te_moe_capacity_overflow = aux.get("te_moe_capacity_overflow", jnp.asarray(False))
   te_moe_max_total_recv_tokens = aux.get("te_moe_max_total_recv_tokens", jnp.asarray(0, dtype=jnp.int32))
@@ -575,6 +590,8 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
 
   def apply_training_updates(state):
     """Apply every mutable training-state update for a valid MoE step."""
+    moe_bias_updates = aux.get("moe_bias_updates")
+    mtp_moe_bias_updates = aux.get("mtp_moe_bias_updates")
 
     if isinstance(model, nn.Module):
       if config.gradient_clipping_threshold > 0:
@@ -778,8 +795,11 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
 
   if isinstance(model, nn.Module):
     return new_state, metrics
-  # Drop Intermediates and RngState before returning; both are absent from state_mesh_shardings.
-  return nnx.state(new_state, nnx.Not(nnx.Any(nnx.Intermediate, nnx.RngState))), metrics
+  assert input_pure_state is not None
+  # Drop Intermediates before returning and restrict to the input state's paths so
+  # lazy forward-only keys (e.g. module-level rngs) do not break out_shardings.
+  output_state = nnx.state(new_state, nnx.Not(nnx.Intermediate))
+  return _align_nnx_state_to_template(input_pure_state, output_state), metrics
 
 
 def eval_step(model, config, state, data, dropout_rng=None):
