@@ -156,7 +156,7 @@ def gradient_accumulation_loss_and_grad(
       "ga_params": ga_params,
   }
   if is_nnx:
-    init_grad_and_loss["rest_state"] = nnx.filter_state(rest, nnx.Not(nnx.RngState))  # pyrefly: ignore[unbound-name]
+    init_grad_and_loss["rest_state"] = rest  # pyrefly: ignore[unbound-name]
 
   grad_and_loss, aux = jax.lax.scan(
       accumulate_gradient, init_grad_and_loss, data, length=config.gradient_accumulation_steps
@@ -193,7 +193,7 @@ def gradient_accumulation_loss_and_grad(
     aux["te_moe_recv_capacity_per_rank"] = jnp.min(scanned_aux["te_moe_recv_capacity_per_rank"], axis=0)
 
   if is_nnx:
-    nnx.update(model, nnx.filter_state(grad_and_loss["rest_state"], nnx.Not(nnx.RngState)))
+    nnx.update(model, grad_and_loss["rest_state"])
 
   return loss, aux, raw_grads
 
