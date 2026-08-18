@@ -441,11 +441,19 @@ def _align_nnx_state_to_template(template_state: nnx.State, state: nnx.State) ->
   Forward can materialize lazy module-level ``rngs`` subtrees that are absent from
   ``state_mesh_shardings``. Drop those extra keys while keeping template paths
   (e.g. ``decoder.dropout``) even when they hold RngState.
+  Unlike ``to_pure_dict`` round-trips, this preserves NNX Variable types (Param,
+  RngState, OptVariable, etc.) required by ``out_shardings``.
   """
-  template_flat = traverse_util.flatten_dict(template_state.to_pure_dict())
-  state_flat = traverse_util.flatten_dict(state.to_pure_dict())
-  aligned_flat = {path: state_flat[path] if path in state_flat else template_flat[path] for path in template_flat}
-  return nnx.State(traverse_util.unflatten_dict(aligned_flat))
+  aligned = {}
+  for key, template_val in template_state.items():
+    if isinstance(template_val, nnx.State):
+      state_sub = state[key] if key in state else nnx.State({})
+      if not isinstance(state_sub, nnx.State):
+        state_sub = nnx.State({})
+      aligned[key] = _align_nnx_state_to_template(template_val, state_sub)
+    else:
+      aligned[key] = state[key] if key in state else template_val
+  return nnx.State(aligned)
 
 
 def train_step(model, config, state_mesh_shardings, params_shardings, state, data, dropout_rng=None):
@@ -796,10 +804,13 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   if isinstance(model, nn.Module):
     return new_state, metrics
   assert input_pure_state is not None
-  # Drop Intermediates before returning and restrict to the input state's paths so
-  # lazy forward-only keys (e.g. module-level rngs) do not break out_shardings.
+  # Drop Intermediates before returning and restrict the model subtree to the input
+  # state's paths so lazy forward-only keys (e.g. module-level rngs) do not break
+  # out_shardings. Leave optimizer (OptVariable/OptState leaves) untouched.
   output_state = nnx.state(new_state, nnx.Not(nnx.Intermediate))
-  return _align_nnx_state_to_template(input_pure_state, output_state), metrics
+  aligned_output = dict(output_state)
+  aligned_output["model"] = _align_nnx_state_to_template(input_pure_state["model"], output_state["model"])
+  return nnx.State(aligned_output), metrics
 
 
 def eval_step(model, config, state, data, dropout_rng=None):
