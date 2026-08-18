@@ -638,7 +638,8 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
         moe_bias_updates = jnp.array(moe_bias_updates[0]).transpose()
         new_state = maxtext_utils.update_state_param(new_state, target_path, moe_bias_updates)
 
-      new_state = qk_clip_utils.apply_qk_clip(new_state, intermediate_outputs, config)
+      if config.use_qk_clip:
+        new_state = qk_clip_utils.apply_qk_clip(new_state, intermediate_outputs, config)
     else:
       if config.gradient_clipping_threshold > 0:
         grads = maxtext_utils.apply_gradient_clipping(raw_grads, None, config.gradient_clipping_threshold)
@@ -713,7 +714,8 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
               if mtp_bias is not None:
                 mtp_bias.value = mtp_bias.value + jnp.array(update)
 
-      new_state = qk_clip_utils.apply_qk_clip_nnx(new_state, intermediate_outputs, config)
+      if config.use_qk_clip:
+        new_state = qk_clip_utils.apply_qk_clip_nnx(new_state, intermediate_outputs, config)
 
     return new_state
 
