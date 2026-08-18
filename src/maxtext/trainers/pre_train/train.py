@@ -435,25 +435,36 @@ def _find_gate_bias(module: nnx.Module | None) -> nnx.Variable | None:
   return None
 
 
-def _align_nnx_state_to_template(template_state: nnx.State, state: nnx.State) -> nnx.State:
+def _is_nnx_mapping(node) -> bool:
+  return isinstance(node, (dict, nnx.State))
+
+
+def _align_nnx_state_to_template(template_state, state):
   """Return state restricted to template paths so JIT I/O matches init shardings.
 
   Forward can materialize lazy module-level ``rngs`` subtrees that are absent from
   ``state_mesh_shardings``. Drop those extra keys while keeping template paths
   (e.g. ``decoder.dropout``) even when they hold RngState.
-  Unlike ``to_pure_dict`` round-trips, this preserves NNX Variable types (Param,
-  RngState, OptVariable, etc.) required by ``out_shardings``.
+
+  Unlike ``to_pure_dict`` round-trips, Variable leaves are copied directly. Unlike
+  ``nnx.State({...})``, nested module containers stay plain ``dict``s so the
+  returned pytree matches ``nnx.split`` / ``out_shardings`` (see
+  ``sharding.maybe_update_params_sharding_with_opt_nnx``).
   """
+  if not _is_nnx_mapping(template_state):
+    return state if state is not None else template_state
+
   aligned = {}
+  state_map = state if _is_nnx_mapping(state) else {}
+
   for key, template_val in template_state.items():
-    if isinstance(template_val, nnx.State):
-      state_sub = state[key] if key in state else nnx.State({})
-      if not isinstance(state_sub, nnx.State):
-        state_sub = nnx.State({})
+    if _is_nnx_mapping(template_val):
+      state_sub = state_map[key] if key in state_map and _is_nnx_mapping(state_map[key]) else {}
       aligned[key] = _align_nnx_state_to_template(template_val, state_sub)
     else:
-      aligned[key] = state[key] if key in state else template_val
-  return nnx.State(aligned)
+      aligned[key] = state_map[key] if key in state_map else template_val
+
+  return aligned
 
 
 def train_step(model, config, state_mesh_shardings, params_shardings, state, data, dropout_rng=None):
@@ -806,11 +817,11 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   assert input_pure_state is not None
   # Drop Intermediates before returning and restrict the model subtree to the input
   # state's paths so lazy forward-only keys (e.g. module-level rngs) do not break
-  # out_shardings. Leave optimizer (OptVariable/OptState leaves) untouched.
+  # out_shardings. Preserve the split-state pytree types (dict module subtrees, etc.).
   output_state = nnx.state(new_state, nnx.Not(nnx.Intermediate))
-  aligned_output = dict(output_state)
-  aligned_output["model"] = _align_nnx_state_to_template(input_pure_state["model"], output_state["model"])
-  return nnx.State(aligned_output), metrics
+  result = jax.tree_util.tree_map(lambda x: x, output_state, is_leaf=lambda x: isinstance(x, nnx.Variable))
+  result["model"] = _align_nnx_state_to_template(input_pure_state["model"], output_state["model"])
+  return result, metrics
 
 
 def eval_step(model, config, state, data, dropout_rng=None):
