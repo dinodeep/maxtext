@@ -114,13 +114,12 @@ def gradient_accumulation_loss_and_grad(
     # Enable it with JAX_OPTIMIZATION_LEVEL=O1 and
     # XLA_FLAGS="--xla_gpu_enable_while_loop_unrolling=WHILE_LOOP_UNROLLING_MANUAL_UNROLL".
     if is_nnx:
-      # Reconstruct the model using the fixed parameters (ga_params)
-      # and the advancing non-parameter state (RNGs) from the carry.
+      # Reconstruct the model using the fixed parameters (ga_params) and the initial
+      # non-parameter state. rest_state is not advanced inside the scan: forward can
+      # materialize lazy RngState keys that would change the carry pytree structure.
       local_model = nnx.merge(graphdef, ga_params, acc_grad_and_loss["rest_state"], copy=True)
       with set_xla_metadata(_xla_loop_unroll_strategy="double-buffer"):
         (_, aux), cur_batch_gradient = grad_func(local_model, config, data, None, None, is_train=True)
-      _, _, next_rest_state = nnx.split(local_model, nnx.Param, ...)
-      acc_grad_and_loss["rest_state"] = nnx.filter_state(next_rest_state, nnx.Not(nnx.RngState))
     else:
       rng = (
           jax.random.fold_in(dropout_rng, acc_grad_and_loss["total_weights"].astype(jnp.int32))
@@ -157,7 +156,7 @@ def gradient_accumulation_loss_and_grad(
       "ga_params": ga_params,
   }
   if is_nnx:
-    init_grad_and_loss["rest_state"] = rest  # pyrefly: ignore[unbound-name]
+    init_grad_and_loss["rest_state"] = nnx.filter_state(rest, nnx.Not(nnx.RngState))  # pyrefly: ignore[unbound-name]
 
   grad_and_loss, aux = jax.lax.scan(
       accumulate_gradient, init_grad_and_loss, data, length=config.gradient_accumulation_steps
