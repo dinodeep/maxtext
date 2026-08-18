@@ -120,7 +120,7 @@ def gradient_accumulation_loss_and_grad(
       with set_xla_metadata(_xla_loop_unroll_strategy="double-buffer"):
         (_, aux), cur_batch_gradient = grad_func(local_model, config, data, None, None, is_train=True)
       _, _, next_rest_state = nnx.split(local_model, nnx.Param, ...)
-      acc_grad_and_loss["rest_state"] = next_rest_state
+      acc_grad_and_loss["rest_state"] = nnx.filter_state(next_rest_state, nnx.Not(nnx.RngState))
     else:
       rng = (
           jax.random.fold_in(dropout_rng, acc_grad_and_loss["total_weights"].astype(jnp.int32))
@@ -194,7 +194,7 @@ def gradient_accumulation_loss_and_grad(
     aux["te_moe_recv_capacity_per_rank"] = jnp.min(scanned_aux["te_moe_recv_capacity_per_rank"], axis=0)
 
   if is_nnx:
-    nnx.update(model, grad_and_loss["rest_state"])
+    nnx.update(model, nnx.filter_state(grad_and_loss["rest_state"], nnx.Not(nnx.RngState)))
 
   return loss, aux, raw_grads
 

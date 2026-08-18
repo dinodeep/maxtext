@@ -540,7 +540,7 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       def diff_wrapper(curr_params, custom_params, rest, config, data):
         local_model = nnx.merge(model_graphdef, curr_params, custom_params, rest, copy=True)
         loss, aux = loss_fn(local_model, config, data, None, None, is_train=True)
-        non_param_rest = nnx.state(local_model, nnx.Not(nnx.Any(nnx.Param, nnx.Intermediate)))
+        non_param_rest = nnx.state(local_model, nnx.Not(nnx.Any(nnx.Param, nnx.Intermediate, nnx.RngState)))
         return loss, (aux, non_param_rest)
 
       grad_func = jax.value_and_grad(diff_wrapper, argnums=(0, 1), has_aux=True)
@@ -778,10 +778,8 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
 
   if isinstance(model, nn.Module):
     return new_state, metrics
-  # Drop Intermediates (e.g. sowed max_logits for QK-Clip) and the MTP sown
-  # vars (mtp_losses/mtp_acceptance) before returning. They're absent from
-  # state_mesh_shardings and would cause a leaf-count / structure mismatch.
-  return nnx.state(new_state, nnx.Not(nnx.Intermediate)), metrics
+  # Drop Intermediates and RngState before returning; both are absent from state_mesh_shardings.
+  return nnx.state(new_state, nnx.Not(nnx.Any(nnx.Intermediate, nnx.RngState))), metrics
 
 
 def eval_step(model, config, state, data, dropout_rng=None):
