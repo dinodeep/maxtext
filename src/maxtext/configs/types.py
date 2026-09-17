@@ -845,6 +845,10 @@ class CompressedAttention(BaseModel):
       False,
       description="Whether to use Pallas TPU kernel for CSA StreamIndex score computation.",
   )
+  use_dsv4_cudnn: bool = Field(
+      False,
+      description="Use cuDNN Frontend CuTeDSL kernels for ratio-4 DeepSeek-V4 CSA training.",
+  )
 
 
 class AttentionIndexer(BaseModel):
@@ -4698,6 +4702,23 @@ class MaxTextConfig(
               "DeepSeek4 is only supported with `dot_product` attention or `flash` attention "
               "with `use_tokamax_splash=True`."
           )
+    if self.use_dsv4_cudnn:
+      if self.decoder_block != DecoderBlockType.DEEPSEEK4:
+        raise ValueError("`use_dsv4_cudnn=True` requires `decoder_block='deepseek4'`.")
+      if self.hardware not in ("gpu", "gpu_multiprocess"):
+        raise ValueError("`use_dsv4_cudnn=True` requires NVIDIA GPU hardware.")
+      if self.packing:
+        raise ValueError("`use_dsv4_cudnn=True` currently requires `packing=False`.")
+      if not self.use_indexer or 4 not in self.compress_ratios:
+        raise ValueError("`use_dsv4_cudnn=True` requires a ratio-4 layer and `use_indexer=True`.")
+      if (self.num_query_heads, self.head_dim, self.indexer_n_heads, self.indexer_head_dim) != (64, 512, 64, 128):
+        raise ValueError("cuDNN DSv4 requires attention H=64/D=512 and indexer H=64/D=128.")
+      if self.indexer_topk != 512 or self.sliding_window_size != 128:
+        raise ValueError("cuDNN DSv4 requires `indexer_topk=512` and `sliding_window_size=128`.")
+      if self.ici_tensor_parallelism * self.dcn_tensor_parallelism != 1:
+        raise ValueError("cuDNN DSv4 does not yet support tensor parallelism.")
+      if self.ici_context_parallelism * self.dcn_context_parallelism != 1:
+        raise ValueError("cuDNN DSv4 does not yet support context parallelism.")
     if self.mla_qk_head_chunk_size > 0:
       if self.mla_qk_head_chunk_size > self.num_query_heads or self.num_query_heads % self.mla_qk_head_chunk_size != 0:
         raise ValueError(
