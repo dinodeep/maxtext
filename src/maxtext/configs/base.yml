@@ -539,7 +539,7 @@ o_groups: 0 # Output groups for Compressed Attention.
 compress_ratios: [] # Per-layer compression ratios (0, 4, 128, etc).
 compressed_rope_max_timescale: 160_000 # If positive, used for Compressed Sparse/Heavy Attention.
 use_csa_streamindex_kernel: false # Whether to use Pallas TPU kernel for CSA StreamIndex score computation.
-use_dsv4_cudnn: false # Use cuDNN Frontend CuTeDSL kernels for ratio-4 DSv4 CSA training.
+te_dsv4_csa: false # Use Transformer Engine's cuDNN-backed ratio-4 DSv4 CSA kernels.
 
 # QK-Clip (Muon Clip) Configuration
 use_qk_clip: false  # Enable QK-Clip (supported in MLA with DotProduct or Tokamax Splash)

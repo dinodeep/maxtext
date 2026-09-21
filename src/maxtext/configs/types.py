@@ -845,7 +845,7 @@ class CompressedAttention(BaseModel):
       False,
       description="Whether to use Pallas TPU kernel for CSA StreamIndex score computation.",
   )
-  use_dsv4_cudnn: bool = Field(
+  te_dsv4_csa: bool = Field(
       False,
       description="Use cuDNN Frontend CuTeDSL kernels for ratio-4 DeepSeek-V4 CSA training.",
   )
@@ -4702,15 +4702,15 @@ class MaxTextConfig(
               "DeepSeek4 is only supported with `dot_product` attention or `flash` attention "
               "with `use_tokamax_splash=True`."
           )
-    if self.use_dsv4_cudnn:
+    if self.te_dsv4_csa:
       if self.decoder_block != DecoderBlockType.DEEPSEEK4:
-        raise ValueError("`use_dsv4_cudnn=True` requires `decoder_block='deepseek4'`.")
+        raise ValueError("`te_dsv4_csa=True` requires `decoder_block='deepseek4'`.")
       if self.hardware not in ("gpu", "gpu_multiprocess"):
-        raise ValueError("`use_dsv4_cudnn=True` requires NVIDIA GPU hardware.")
+        raise ValueError("`te_dsv4_csa=True` requires NVIDIA GPU hardware.")
       if self.packing:
-        raise ValueError("`use_dsv4_cudnn=True` currently requires `packing=False`.")
+        raise ValueError("`te_dsv4_csa=True` currently requires `packing=False`.")
       if not self.use_indexer or 4 not in self.compress_ratios:
-        raise ValueError("`use_dsv4_cudnn=True` requires a ratio-4 layer and `use_indexer=True`.")
+        raise ValueError("`te_dsv4_csa=True` requires a ratio-4 layer and `use_indexer=True`.")
       if (self.num_query_heads, self.head_dim, self.indexer_n_heads, self.indexer_head_dim) != (64, 512, 64, 128):
         raise ValueError("cuDNN DSv4 requires attention H=64/D=512 and indexer H=64/D=128.")
       if self.indexer_topk != 512 or self.sliding_window_size != 128:

@@ -929,7 +929,7 @@ class DeepseekV4Indexer(nnx.Module):
       A tuple (top_k_indices, indexer_scores) where indexer_scores is None when return_scores=False.
     """
     batch_size, seq_len, _ = hidden_states.shape
-    use_cudnn_csa = getattr(self.config, "use_dsv4_cudnn", False)
+    use_cudnn_csa = getattr(self.config, "te_dsv4_csa", False)
     # Stop gradient on indexer inputs so indexer loss does not backprop into main model projections
     hidden_states = jax.lax.stop_gradient(hidden_states)
     q_latent = jax.lax.stop_gradient(q_latent)
@@ -1192,7 +1192,7 @@ class DeepseekV4CSACompressor(BaseDeepseekCompressor):
       index_scores (optional): The raw indexer scores if return_indexer_scores is True.
     """
     batch_size, seq_len, _ = hidden_states.shape
-    use_cudnn_csa = getattr(self.config, "use_dsv4_cudnn", False)
+    use_cudnn_csa = getattr(self.config, "te_dsv4_csa", False)
 
     # 1. Run Indexer if use_indexer is True
     if use_indexer:
@@ -1728,9 +1728,9 @@ class CompressedAttention(Attention):
     """
     kv_cache = kwargs.get("kv_cache", None)
 
-    use_cudnn_csa = getattr(self.config, "use_dsv4_cudnn", False) and self.compress_ratio == 4
+    use_cudnn_csa = getattr(self.config, "te_dsv4_csa", False) and self.compress_ratio == 4
     if use_cudnn_csa and model_mode != MODEL_MODE_TRAIN:
-      raise NotImplementedError("use_dsv4_cudnn currently supports DSv4 training only")
+      raise NotImplementedError("te_dsv4_csa currently supports DSv4 training only")
 
     q, q_normed = self.compressed_query_projection(inputs_q, inputs_positions, model_mode)
     q = checkpoint_name(q, "query_proj")
