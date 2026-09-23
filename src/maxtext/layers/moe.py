@@ -307,11 +307,23 @@ def calculate_load_balance_updates(top_k_indices, num_experts, rate, axis_names=
   expert_counts = jnp.sum(jax.nn.one_hot(flat_indices, num_experts, dtype=jnp.int32), axis=0)
   if axis_names:
     expert_counts = jax.lax.psum(expert_counts, axis_names)
+  return calculate_load_balance_updates_from_counts(expert_counts, rate)
+
+
+def calculate_load_balance_updates_from_counts(expert_counts, rate):
+  """Computes a bias adjustment update from global assignment counts.
+
+  Args:
+      expert_counts: Global top-k assignment counts. Shape (num_experts,).
+      rate: The update rate.
+
+  Returns:
+      The value to add to the expert routing bias. Shape (num_experts,).
+  """
   total_tokens = jnp.sum(expert_counts)
-  average_load = total_tokens / num_experts
+  average_load = total_tokens / expert_counts.shape[0]
   direction = jnp.sign(average_load - expert_counts)
-  output = direction * rate
-  return output
+  return direction * rate
 
 
 def _batch_axis_names(pspec) -> tuple[str, ...] | None:
@@ -3791,7 +3803,7 @@ class RoutedMoE(nnx.Module):
         n_expert_groups=self.num_experts,
     )
 
-    output, lb_loss, total_recv_tokens = te_moe.moe(
+    output, lb_loss, total_recv_tokens, expert_counts = te_moe.moe(
         inputs,
         gate_kernel,
         wi_kernel,
@@ -3819,6 +3831,7 @@ class RoutedMoE(nnx.Module):
         wo_kernel_axes=self.wo_kernel_axes,
         dtype=self.dtype,
         recv_capacity_per_rank=max_utils.get_te_moe_recv_capacity_per_rank(),
+        collect_expert_counts=self.should_update_load_balance(),
     )
     recv_capacity_per_rank = max_utils.get_te_moe_recv_capacity_per_rank()
     output = output.astype(self.dtype)
@@ -3826,7 +3839,18 @@ class RoutedMoE(nnx.Module):
       lb_loss = lb_loss.astype(self.dtype)
     if out_sharding is not None:
       output = jax.lax.with_sharding_constraint(output, out_sharding)
-    return output, lb_loss, (total_recv_tokens, jnp.asarray(recv_capacity_per_rank, dtype=jnp.int32))
+    bias_updates = None
+    if self.should_update_load_balance():
+      bias_updates = calculate_load_balance_updates_from_counts(expert_counts, self.config.routed_bias_update_rate)
+    return (
+        output,
+        lb_loss,
+        (
+            total_recv_tokens,
+            jnp.asarray(recv_capacity_per_rank, dtype=jnp.int32),
+            bias_updates,
+        ),
+    )
 
   def __call__(
       self,

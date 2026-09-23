@@ -349,6 +349,19 @@ class DeepSeekRoutingTest(unittest.TestCase):
 
     assert_moe_close(actual_updates, expected_updates, jnp.float32)
 
+  def test_deepseek_bias_updates_from_counts(self):
+    expert_counts = jnp.array([6, 8, 10, 8], dtype=jnp.int32)
+    expected_updates = jnp.array([0.01, 0.0, -0.01, 0.0], dtype=jnp.float32)
+
+    actual_updates = moe.calculate_load_balance_updates_from_counts(expert_counts, rate=0.01)
+
+    assert_moe_close(actual_updates, expected_updates, jnp.float32)
+    assert_moe_close(
+        moe.calculate_load_balance_updates_from_counts(expert_counts, rate=0.0),
+        jnp.zeros((4,), dtype=jnp.float32),
+        jnp.float32,
+    )
+
   def test_batch_axis_names(self):
     # pylint: disable=protected-access
     self.assertIsNone(moe._batch_axis_names(None))
