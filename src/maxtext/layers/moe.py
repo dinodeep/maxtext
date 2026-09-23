@@ -643,6 +643,7 @@ class RoutedMoE(nnx.Module):
     else:
       self.quant_einsums = None
 
+    self.use_gate_bias = self.config.routed_bias and not self.is_hash_routing
     self.gate = GateLogit(
         in_features_shape=self.moe_expert_input_dim,
         out_features_shape=self.num_experts,
@@ -653,7 +654,7 @@ class RoutedMoE(nnx.Module):
         quant=self.quant,
         kernel_init=self.kernel_init,
         kernel_axes=self.kernel_axes,
-        use_bias=self.config.routed_bias and not self.is_hash_routing,
+        use_bias=self.use_gate_bias,
         # tpu-inference applies the score function in the fused_moe_gmm kernel,
         # so we don't apply it here to avoid redundant computation.
         # See https://github.com/vllm-project/tpu-inference/blob/main/tpu_inference/layers/common/fused_moe_gmm.py#L58.
@@ -3785,9 +3786,7 @@ class RoutedMoE(nnx.Module):
     if self.quant is None or not hasattr(self.quant, "get_moe_block_quantizer_sets"):
       raise ValueError("te_moe_block=True requires TransformerEngine quantization or te_gmm_quantization=te_no_quant.")
 
-    expert_bias = None
-    if self.config.routed_bias:
-      expert_bias = jnp.asarray(self.gate.bias[...], jnp.float32)
+    expert_bias = jnp.asarray(self.gate.bias[...], jnp.float32) if self.use_gate_bias else None
 
     fsdp_size = self.mesh.shape.get("fsdp", 1)
     ep_size = self.mesh.shape.get(self._expert_parallelism_name, 1)
