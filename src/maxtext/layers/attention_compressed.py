@@ -657,6 +657,20 @@ class DeepseekV4HCACompressor(BaseDeepseekCompressor):
 
       return compressed_kv, compressed_mask
 
+    # cuDNN HCA training: the fused compressor replaces chunked softmax pooling, and
+    # cuDNN sparse attention builds its own causal block list, so no mask is returned.
+    if (
+        getattr(self.config, "te_dsv4_hca", False)
+        and model_mode == MODEL_MODE_TRAIN
+        and cache is None
+        and seq_len >= self.compress_rate
+    ):
+      usable = (seq_len // self.compress_rate) * self.compress_rate
+      compressed = dsv4_cudnn.compress_ratio128(kv, gate, self.position_bias.value)
+      compressed = self.kv_norm(compressed)
+      compressed = self.rotary_emb(compressed, position_ids[:, : usable : self.compress_rate], unsqueeze_dim=None)
+      return jnp.expand_dims(compressed, axis=2), None
+
     # --- PREFILL CHUNKING & PRIMING ---
     usable = (seq_len // self.compress_rate) * self.compress_rate
     chunk_kv = kv[:, :usable]
@@ -912,9 +926,7 @@ class DeepseekV4Indexer(nnx.Module):
 
     # --- PREFILL CHUNKING & PRIMING ---
     else:
-      pooling_fn = (
-          compute_cudnn_csa_prefill_pooling if use_cudnn_csa else compute_csa_prefill_chunk_pooling
-      )
+      pooling_fn = compute_cudnn_csa_prefill_pooling if use_cudnn_csa else compute_csa_prefill_chunk_pooling
       pooling_kwargs = dict(
           kv=kv,
           gate=gate,
@@ -961,9 +973,7 @@ class DeepseekV4Indexer(nnx.Module):
 
     head_chunk_size = getattr(self.config, "csa_qk_head_chunk_size", 0)
     if use_cudnn_csa:
-      index_scores = dsv4_cudnn.indexer_ratio4(
-          q, compressed, weights, softmax_scale=self.softmax_scale
-      )
+      index_scores = dsv4_cudnn.indexer_ratio4(q, compressed, weights, softmax_scale=self.softmax_scale)
     elif head_chunk_size > 0:
       # Student chunks indexer heads (indexer_n_heads); teacher path
       # in calculate_csa_indexer_loss chunks query heads (num_query_heads).
@@ -1174,9 +1184,7 @@ class DeepseekV4CSACompressor(BaseDeepseekCompressor):
 
     # --- PREFILL CHUNKING & PRIMING ---
     else:
-      pooling_fn = (
-          compute_cudnn_csa_prefill_pooling if use_cudnn_csa else compute_csa_prefill_chunk_pooling
-      )
+      pooling_fn = compute_cudnn_csa_prefill_pooling if use_cudnn_csa else compute_csa_prefill_chunk_pooling
       pooling_kwargs = dict(
           kv=kv,
           gate=gate,
@@ -1653,6 +1661,10 @@ class CompressedAttention(Attention):
     use_cudnn_csa = getattr(self.config, "te_dsv4_csa", False) and self.compress_ratio == 4
     if use_cudnn_csa and model_mode != MODEL_MODE_TRAIN:
       raise NotImplementedError("te_dsv4_csa currently supports DSv4 training only")
+    use_cudnn_hca = getattr(self.config, "te_dsv4_hca", False) and self.compress_ratio > 4
+    if use_cudnn_hca and model_mode != MODEL_MODE_TRAIN:
+      raise NotImplementedError("te_dsv4_hca currently supports DSv4 training only")
+    use_cudnn_sparse = use_cudnn_csa or use_cudnn_hca
 
     q, q_normed = self.compressed_query_projection(inputs_q, inputs_positions, model_mode)
     q = checkpoint_name(q, "query_proj")
@@ -1779,7 +1791,7 @@ class CompressedAttention(Attention):
     # Pad total KV length to tile size multiple (config.sa_block_kv) for SPMD sequence divisibility and
     # Tokamax dynamic splash tile boundary alignment. Note: Tokamax kernel inside AttentionOp additionally
     # sets inner block size as min(block_kv, key_len) during kernel invocation.
-    if self.attention_kernel == "flash" and not use_cudnn_csa:
+    if self.attention_kernel == "flash" and not use_cudnn_sparse:
       comp_len = compressed_kv.shape[1] if compressed_kv is not None else 0
       _, pad_kv_total = compute_hca_padding(
           q_len=inputs_q.shape[1],
@@ -1804,7 +1816,7 @@ class CompressedAttention(Attention):
             decoder_segment_ids_kv = jnp.pad(decoder_segment_ids_kv, ((0, 0), (0, pad_kv_total)), constant_values=-1)
 
     # Prepare the mask shape for the underlying AttentionOp
-    if compressed_mask is not None and not use_cudnn_csa:
+    if compressed_mask is not None and not use_cudnn_sparse:
       compressed_mask = jnp.expand_dims(compressed_mask, axis=2)
 
     # Scale queries if a pre-attention scalar is defined
@@ -1823,10 +1835,26 @@ class CompressedAttention(Attention):
           indexer_topk=self.config.indexer_topk,
           window_size=self.sliding_window_size,
       )
+    elif use_cudnn_hca:
+      if compressed_kv is None or self.sinks is None:
+        raise ValueError("cuDNN DSv4 HCA requires compressed KV and attention sinks")
+      attn_out = dsv4_cudnn.sparse_attention_hca(
+          q,
+          kv,
+          compressed_kv,
+          self.sinks.value,
+          compress_ratio=self.compress_ratio,
+          window_size=self.sliding_window_size,
+      )
 
     # Build indexer mask explicitly for tokamax splash kernel (CSA dynamic path)
     indexer_mask = None
-    if not use_cudnn_csa and self.attention_kernel == "flash" and compressed_mask is not None and self.compress_ratio == 4:
+    if (
+        not use_cudnn_sparse
+        and self.attention_kernel == "flash"
+        and compressed_mask is not None
+        and self.compress_ratio == 4
+    ):
       indexer_mask = self.attention_op.generate_attention_mask(
           q,
           unpadded_kv,
@@ -1843,7 +1871,7 @@ class CompressedAttention(Attention):
 
     # Compute Attention
     # -> [batch, q_length, num_query_heads, head_dim]
-    if not use_cudnn_csa:
+    if not use_cudnn_sparse:
       attn_out = self.attention_op(
           q,
           kv,

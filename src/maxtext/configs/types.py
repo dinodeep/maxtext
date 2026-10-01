@@ -801,6 +801,10 @@ class CompressedAttention(BaseModel):
       False,
       description="Use cuDNN Frontend CuTeDSL kernels for ratio-4 DeepSeek-V4 CSA training.",
   )
+  te_dsv4_hca: bool = Field(
+      False,
+      description="Use cuDNN Frontend CuTeDSL kernels for ratio-128 DeepSeek-V4 HCA training.",
+  )
 
 
 class AttentionIndexer(BaseModel):
@@ -4315,6 +4319,24 @@ class MaxTextConfig(
         raise ValueError("cuDNN DSv4 requires attention H=64/D=512 and indexer H=64/D=128.")
       if self.indexer_topk != 512 or self.sliding_window_size != 128:
         raise ValueError("cuDNN DSv4 requires `indexer_topk=512` and `sliding_window_size=128`.")
+      if self.ici_tensor_parallelism * self.dcn_tensor_parallelism != 1:
+        raise ValueError("cuDNN DSv4 does not yet support tensor parallelism.")
+      if self.ici_context_parallelism * self.dcn_context_parallelism != 1:
+        raise ValueError("cuDNN DSv4 does not yet support context parallelism.")
+    if self.te_dsv4_hca:
+      if self.decoder_block != DecoderBlockType.DEEPSEEK4:
+        raise ValueError("`te_dsv4_hca=True` requires `decoder_block='deepseek4'`.")
+      if self.hardware not in ("gpu", "gpu_multiprocess"):
+        raise ValueError("`te_dsv4_hca=True` requires NVIDIA GPU hardware.")
+      if self.packing:
+        raise ValueError("`te_dsv4_hca=True` currently requires `packing=False`.")
+      hca_ratios = {ratio for ratio in self.compress_ratios if ratio > 4}
+      if hca_ratios != {128}:
+        raise ValueError(f"`te_dsv4_hca=True` requires HCA layers with compress ratio 128, got {sorted(hca_ratios)}.")
+      if (self.num_query_heads, self.head_dim) != (64, 512):
+        raise ValueError("cuDNN DSv4 HCA requires attention H=64/D=512.")
+      if self.sliding_window_size <= 0:
+        raise ValueError("cuDNN DSv4 HCA requires a positive `sliding_window_size`.")
       if self.ici_tensor_parallelism * self.dcn_tensor_parallelism != 1:
         raise ValueError("cuDNN DSv4 does not yet support tensor parallelism.")
       if self.ici_context_parallelism * self.dcn_context_parallelism != 1:
