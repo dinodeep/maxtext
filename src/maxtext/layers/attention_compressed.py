@@ -1229,12 +1229,18 @@ class DeepseekV4CSACompressor(BaseDeepseekCompressor):
     # 3. Apply Dynamic Masking Logic
     k = top_k_indices.shape[-1]
     if k > 0:
-      valid = top_k_indices >= 0
-      entry_indices = jnp.arange(compressed_len)[None, None, :]
-      is_in_topk = jnp.expand_dims(top_k_indices, axis=-1) == entry_indices[None, ...]
-      is_valid_and_in_topk = is_in_topk & jnp.expand_dims(valid, axis=-1)
+      # Scatter the selected block ids straight into a [batch, seq, compressed_len] mask rather
+      # than materializing a [batch, seq, k, compressed_len] comparison and reducing it.
+      # Duplicate ids are harmless (set is idempotent). Invalid (-1) ids must map past the end:
+      # JAX wraps negative indices before mode="drop" is applied.
+      safe_indices = jnp.where(top_k_indices >= 0, top_k_indices, compressed_len)
 
-      is_selected = jnp.any(is_valid_and_in_topk, axis=2)
+      def _row_mask(row_indices):
+        return jnp.zeros((compressed_len,), dtype=jnp.bool_).at[row_indices].set(True, mode="drop")
+
+      # vmap (rather than explicit batch/seq index arrays) emits a scatter with batch and seq as
+      # batching dims, which the SPMD partitioner keeps sharded instead of gathering the operand.
+      is_selected = jax.vmap(jax.vmap(_row_mask))(safe_indices)
       is_selected = jnp.expand_dims(is_selected, axis=1)
 
       compressed_mask = jnp.where(is_selected, 0.0, DEFAULT_MASK_VALUE).astype(self.dtype)
