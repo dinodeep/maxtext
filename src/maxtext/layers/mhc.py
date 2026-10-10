@@ -193,9 +193,9 @@ class ManifoldConstrainedHyperConnections(nnx.Module):
         out_sharding=(None,),
     )
 
-  def _get_mhc_weights(self) -> mhc_kernel.MhcWeights:
-    """Collects layer parameters into a structured MhcWeights PyTree."""
-    return mhc_kernel.MhcWeights(
+  def _get_mhc_weights(self, weights_cls=mhc_kernel.MhcWeights):
+    """Collects layer parameters into a structured weights PyTree of `weights_cls`."""
+    return weights_cls(
         norm_scale=jnp.asarray(self.mhc_norm.scale[...], self.dtype),
         pre_alpha=jnp.asarray(self.pre_alpha[...], self.dtype),
         pre_bias=jnp.asarray(self.pre_beta[...], self.dtype),
@@ -243,6 +243,38 @@ class ManifoldConstrainedHyperConnections(nnx.Module):
     output = scale * jax.nn.sigmoid(intermediate) + eps
     return output
 
+  @staticmethod
+  def _apply_branch(branch_fn: Callable, mhc_type: HyperConnectionType, layer_input: Array, **kwargs):
+    """Calls the wrapped branch according to `mhc_type`, returning `(layer_out, metadata)`."""
+    metadata = {}
+    if mhc_type == HyperConnectionType.ATTENTION:
+      layer_out, _ = branch_fn(inputs_q=layer_input, inputs_kv=layer_input, **kwargs)
+    elif mhc_type == HyperConnectionType.MLP_DENSE:
+      layer_out = branch_fn(inputs=layer_input, **kwargs)
+    elif mhc_type == HyperConnectionType.MLP_MOE:
+      layer_out, load_balance_loss, moe_bias_updates = branch_fn(inputs=layer_input, **kwargs)
+      metadata["load_balance_loss"] = load_balance_loss
+      metadata["moe_bias_updates"] = moe_bias_updates
+    else:
+      raise ValueError(f"Unsupported type: {mhc_type}")
+    return layer_out, metadata
+
+  def _te_call(self, norm_fn: Callable, branch_fn: Callable, x: Array, mhc_type: HyperConnectionType, **kwargs):
+    """Sinkhorn mHC with Transformer Engine's fused Triton kernels."""
+    from transformer_engine.jax import mhc as te_mhc  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
+
+    return te_mhc.mhc(
+        x,
+        self._get_mhc_weights(te_mhc.MHCWeights),
+        norm_fn,
+        lambda layer_input: self._apply_branch(branch_fn, mhc_type, layer_input, **kwargs),
+        has_aux=True,
+        norm_epsilon=self.config.normalization_layer_epsilon,
+        pre_mapping_epsilon=1e-6,
+        sinkhorn_iterations=self.sinkhorn_iterations,
+        use_tf32=self.matmul_precision != jax.lax.Precision.HIGHEST,
+    )
+
   def __call__(
       self,
       norm_fn: Callable,
@@ -263,6 +295,9 @@ class ManifoldConstrainedHyperConnections(nnx.Module):
     Returns:
         The processed tensor, maintaining the shape of `x`.
     """
+    if getattr(self.config, "te_mhc", False):
+      return self._te_call(norm_fn, branch_fn, x, mhc_type, **kwargs)
+
     # x shape: [batch, seq, expansion_rate, emb]
     b, s, k, d = x.shape
 
@@ -325,17 +360,7 @@ class ManifoldConstrainedHyperConnections(nnx.Module):
     layer_input = norm_fn(layer_input)
 
     # 4. Attention or MLP
-    metadata = {}
-    if mhc_type == HyperConnectionType.ATTENTION:
-      layer_out, _ = branch_fn(inputs_q=layer_input, inputs_kv=layer_input, **kwargs)
-    elif mhc_type == HyperConnectionType.MLP_DENSE:
-      layer_out = branch_fn(inputs=layer_input, **kwargs)
-    elif mhc_type == HyperConnectionType.MLP_MOE:
-      layer_out, load_balance_loss, moe_bias_updates = branch_fn(inputs=layer_input, **kwargs)
-      metadata["load_balance_loss"] = load_balance_loss
-      metadata["moe_bias_updates"] = moe_bias_updates
-    else:
-      raise ValueError(f"Unsupported type: {mhc_type}")
+    layer_out, metadata = self._apply_branch(branch_fn, mhc_type, layer_input, **kwargs)
 
     if use_kernel:
       fwd_block_size = getattr(self.config, "mhc_pallas_kernel_fwd_block_size", 256)
