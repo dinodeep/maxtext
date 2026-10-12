@@ -38,6 +38,11 @@ try:
 except ImportError:
   pass
 
+#### TMP SOLUTION: not a proper fix to issue below
+# Importing the CUTLASS DSL (used by the cuDNN Frontend kernels) puts cutlass/base_dsl on sys.path,
+# whose torch.py then shadows PyTorch when transformers checks for it, so import transformers first.
+import transformers  # pylint: disable=unused-import
+
 try:
   import tensorflow as tf
 
