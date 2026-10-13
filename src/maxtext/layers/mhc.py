@@ -192,9 +192,9 @@ class ManifoldConstrainedHyperConnections(nnx.Module):
         out_sharding=(None,),
     )
 
-  def _get_mhc_weights(self, weights_cls=mhc_kernel.MhcWeights):
-    """Collects layer parameters into a structured weights PyTree of `weights_cls`."""
-    return weights_cls(
+  def _get_mhc_weights(self):
+    """Collects layer parameters into a structured weights PyTree."""
+    return mhc_kernel.MhcWeights(
         norm_scale=jnp.asarray(self.mhc_norm.scale[...], self.dtype),
         pre_alpha=jnp.asarray(self.pre_alpha[...], self.dtype),
         pre_bias=jnp.asarray(self.pre_beta[...], self.dtype),
@@ -262,17 +262,29 @@ class ManifoldConstrainedHyperConnections(nnx.Module):
     """Sinkhorn mHC with Transformer Engine's fused Triton kernels."""
     from transformer_engine.jax import mhc as te_mhc  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
 
-    return te_mhc.mhc(
-        x,
-        self._get_mhc_weights(te_mhc.MHCWeights),
-        norm_fn,
-        lambda layer_input: self._apply_branch(branch_fn, mhc_type, layer_input, **kwargs),
+    k, d = self.k, self.dim
+    w = self._get_mhc_weights()
+    # MaxText flattens the streams as (k, d) while TE expects (d, k), with x of shape (..., d, k).
+    projection = jnp.concatenate([w.pre_alpha, w.post_alpha, w.res_alpha], axis=-1)  # (k*d, N)
+    phi = projection.reshape(k, d, -1).transpose(2, 1, 0).reshape(-1, d * k)
+    norm_weight = w.norm_scale.reshape(k, d).T.reshape(d * k)
+    alpha = jnp.concatenate([w.pre_scale, w.post_scale, w.res_scale])
+    beta = jnp.concatenate([w.pre_bias, w.post_bias, w.res_bias.reshape(-1)])
+
+    out, metadata = te_mhc.mhc(
+        jnp.swapaxes(x, -1, -2),
+        phi,
+        alpha,
+        beta,
+        lambda layer_input: self._apply_branch(branch_fn, mhc_type, norm_fn(layer_input), **kwargs),
+        norm_weight,
         has_aux=True,
-        norm_epsilon=self.config.normalization_layer_epsilon,
-        pre_mapping_epsilon=1e-6,
-        sinkhorn_iterations=self.sinkhorn_iterations,
         use_tf32=self.matmul_precision != jax.lax.Precision.HIGHEST,
+        norm_eps=self.config.normalization_layer_epsilon,
+        pre_eps=1e-6,
+        sinkhorn_iters=self.sinkhorn_iterations,
     )
+    return jnp.swapaxes(out, -1, -2), metadata
 
   def __call__(
       self,
