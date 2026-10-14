@@ -923,6 +923,20 @@ class CompressedAttention(BaseModel):
       False,
       description="Use cuDNN Frontend CuTeDSL kernels for ratio-128 DeepSeek-V4 HCA training.",
   )
+  te_dsv4_indexer_bwd: bool = Field(
+      False,
+      description=(
+          "Use the cuDNN Frontend fused indexer KL-loss backward for DeepSeek-V4 CSA training. "
+          "Requires `te_dsv4_csa=True` and `indexer_loss_scaling_factor > 0`."
+      ),
+  )
+  te_dsv4_indexer_topk: bool = Field(
+      False,
+      description=(
+          "Use the cuDNN Frontend indexer top-k kernel to select the CSA compressed blocks in DeepSeek-V4 training. "
+          "Requires `te_dsv4_csa=True`."
+      ),
+  )
 
 
 class AttentionIndexer(BaseModel):
@@ -5320,6 +5334,13 @@ class MaxTextConfig(
         raise ValueError("cuDNN DSv4 does not yet support tensor parallelism.")
       if self.ici_context_parallelism * self.dcn_context_parallelism != 1:
         raise ValueError("cuDNN DSv4 does not yet support context parallelism.")
+    if self.te_dsv4_indexer_topk and not self.te_dsv4_csa:
+      raise ValueError("`te_dsv4_indexer_topk=True` requires `te_dsv4_csa=True`.")
+    if self.te_dsv4_indexer_bwd:
+      if not self.te_dsv4_csa:
+        raise ValueError("`te_dsv4_indexer_bwd=True` requires `te_dsv4_csa=True`.")
+      if self.indexer_loss_scaling_factor <= 0.0:
+        raise ValueError("`te_dsv4_indexer_bwd=True` requires `indexer_loss_scaling_factor > 0`.")
     if self.te_mhc and self.hardware not in ("gpu", "gpu_multiprocess"):
       raise ValueError("`te_mhc=True` requires NVIDIA GPU hardware.")
     if self.te_dsv4_hca:

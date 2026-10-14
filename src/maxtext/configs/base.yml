@@ -617,6 +617,8 @@ compressed_rope_max_timescale: 160_000 # If positive, used for Compressed Sparse
 use_csa_streamindex_kernel: false # Whether to use Pallas TPU kernel for CSA StreamIndex score computation.
 te_dsv4_csa: false # Use Transformer Engine's cuDNN-backed ratio-4 DSv4 CSA kernels.
 te_dsv4_hca: false # Use Transformer Engine's cuDNN-backed ratio-128 DSv4 HCA kernels.
+te_dsv4_indexer_bwd: false # Use the cuDNN fused indexer-loss backward (needs te_dsv4_csa and indexer_loss_scaling_factor > 0).
+te_dsv4_indexer_topk: false # Use the cuDNN indexer top-k kernel for CSA block selection in training (needs te_dsv4_csa).
 
 # QK-Clip (Muon Clip) Configuration
 use_qk_clip: false  # Enable QK-Clip (supported in MLA with DotProduct or Tokamax Splash)

@@ -1042,14 +1042,14 @@ class DeepseekV4Indexer(nnx.Module):
     # --- PREFILL CHUNKING & PRIMING ---
     else:
       pooling_fn = compute_cudnn_csa_prefill_pooling if use_cudnn_csa else compute_csa_prefill_chunk_pooling
-      pooling_kwargs = dict(
-          kv=kv,
-          gate=gate,
-          position_ids=position_ids,
-          position_bias=self.position_bias.value,
-          kv_norm=self.kv_norm,
-          rotary_emb=self.rotary_emb,
-      )
+      pooling_kwargs = {
+          "kv": kv,
+          "gate": gate,
+          "position_ids": position_ids,
+          "position_bias": self.position_bias.value,
+          "kv_norm": self.kv_norm,
+          "rotary_emb": self.rotary_emb,
+      }
       if not use_cudnn_csa:
         pooling_kwargs.update(
             seq_len=seq_len,
@@ -1094,11 +1094,27 @@ class DeepseekV4Indexer(nnx.Module):
     # VMEM instead of chunking it, and chunks its own backward.
     use_kernel = self.config.use_csa_streamindex_kernel and model_mode == MODEL_MODE_TRAIN
     head_chunk_size = getattr(self.config, "csa_qk_head_chunk_size", 0)
+    # The cuDNN fused backward covers both the dense (warm-up) and the sparse KL loss; it needs the loss to be
+    # requested.
+    use_fused_indexer_bwd = use_cudnn_csa and return_scores and getattr(self.config, "te_dsv4_indexer_bwd", False)
+    # The cuDNN top-k reads each row's causal prefix only, which matches non-packed training positions.
+    use_cudnn_topk = (
+        use_cudnn_csa
+        and getattr(self.config, "te_dsv4_indexer_topk", False)
+        and model_mode == MODEL_MODE_TRAIN
+        and future_mask is None
+    )
+    fused_indexer_inputs = None
 
     if use_kernel:
       index_scores = self._streamindex_scores_sharded(q, compressed, weights)
     elif use_cudnn_csa:
-      index_scores = dsv4_cudnn.indexer_ratio4(q, compressed, weights, softmax_scale=self.softmax_scale)
+      if use_fused_indexer_bwd:
+        # One forward kernel serves both the top-k below and the fused cuDNN loss backward.
+        fused_indexer_inputs = dsv4_cudnn.indexer_scores_ratio4(q, compressed, weights, softmax_scale=self.softmax_scale)
+        index_scores = fused_indexer_inputs["scores"]
+      else:
+        index_scores = dsv4_cudnn.indexer_ratio4(q, compressed, weights, softmax_scale=self.softmax_scale)
     elif head_chunk_size > 0:
       # Student chunks indexer heads (indexer_n_heads); teacher path
       # in calculate_csa_indexer_loss chunks query heads (num_query_heads).
@@ -1157,11 +1173,21 @@ class DeepseekV4Indexer(nnx.Module):
       index_scores += att_m
       combined_invalid = combined_invalid | (att_m < (DEFAULT_MASK_VALUE / 2))
 
-    top_k_indices = jax.lax.top_k(index_scores, k)[1]
-    invalid = jnp.take_along_axis(combined_invalid, top_k_indices, axis=-1)
+    if use_cudnn_topk:
+      # Positions are arange in non-packed training, so the valid blocks of query t are the prefix
+      # [0, (t + 1) // ratio); blocks excluded by `attention_mask` were pushed to ~-inf above and rank last.
+      top_k_indices = dsv4_cudnn.indexer_top_k_ratio4(index_scores, top_k=k)
+      invalid = (top_k_indices < 0) | jnp.take_along_axis(combined_invalid, jnp.maximum(top_k_indices, 0), axis=-1)
+    else:
+      top_k_indices = jax.lax.top_k(index_scores, k)[1]
+      invalid = jnp.take_along_axis(combined_invalid, top_k_indices, axis=-1)
 
     final_indices = jnp.where(invalid, jnp.full_like(top_k_indices, -1), top_k_indices)
 
+    if fused_indexer_inputs is not None:
+      # The sparse loss needs the selection (-1 = invalid slot) next to the dense scores.
+      fused_indexer_inputs["topk_indices"] = final_indices
+      return final_indices, fused_indexer_inputs
     return final_indices, (index_scores if return_scores else None)
 
 
@@ -1235,7 +1261,8 @@ class DeepseekV4CSACompressor(BaseDeepseekCompressor):
       use_indexer: bool = True,
       return_indexer_scores: bool = False,
       true_length: Optional[Array] = None,
-  ) -> Tuple[Array, Array, Optional[Array]]:
+      return_topk_indices: bool = False,
+  ) -> Tuple[Array, ...]:
     """Forward pass for the CSA compressor.
 
     Args:
@@ -1249,11 +1276,14 @@ class DeepseekV4CSACompressor(BaseDeepseekCompressor):
       use_indexer: Whether to run the indexer to compute sparse attention masks.
       return_indexer_scores: Whether to return indexer scores along with compressed KV and mask.
       true_length: Optional unpadded prompt length per batch row (prefill only), shape `[batch]`.
+      return_topk_indices: Whether to append the indexer's selected block ids ([batch, seq, k], -1 =
+        invalid; None if the indexer did not run) as a fourth return value.
 
     Returns:
       compressed_kv: The pooled KV tensors.
       compressed_mask: The sparse attention mask computed by the indexer.
       index_scores (optional): The raw indexer scores if return_indexer_scores is True.
+      top_k_indices (only if return_topk_indices): the indexer's selected block ids.
     """
     batch_size, seq_len, _ = hidden_states.shape
     use_cudnn_csa = getattr(self.config, "te_dsv4_csa", False)
@@ -1317,14 +1347,14 @@ class DeepseekV4CSACompressor(BaseDeepseekCompressor):
     # --- PREFILL CHUNKING & PRIMING ---
     else:
       pooling_fn = compute_cudnn_csa_prefill_pooling if use_cudnn_csa else compute_csa_prefill_chunk_pooling
-      pooling_kwargs = dict(
-          kv=kv,
-          gate=gate,
-          position_ids=position_ids,
-          position_bias=self.position_bias.value,
-          kv_norm=self.kv_norm,
-          rotary_emb=self.rotary_emb,
-      )
+      pooling_kwargs = {
+          "kv": kv,
+          "gate": gate,
+          "position_ids": position_ids,
+          "position_bias": self.position_bias.value,
+          "kv_norm": self.kv_norm,
+          "rotary_emb": self.rotary_emb,
+      }
       if not use_cudnn_csa:
         pooling_kwargs.update(
             seq_len=seq_len,
@@ -1354,11 +1384,13 @@ class DeepseekV4CSACompressor(BaseDeepseekCompressor):
 
     if compressed_len == 0:
       empty_mask = jnp.zeros((batch_size, 1, seq_len, 0), dtype=self.dtype)
-      return compressed_kv, empty_mask, (indexer_scores if return_indexer_scores else None)
+      outputs = (compressed_kv, empty_mask, (indexer_scores if return_indexer_scores else None))
+      return outputs + (None,) if return_topk_indices else outputs
 
     if not use_indexer or top_k_indices is None:
       compressed_mask = jnp.zeros((batch_size, 1, seq_len, compressed_len), dtype=self.dtype)
-      return compressed_kv, compressed_mask, None
+      outputs = (compressed_kv, compressed_mask, None)
+      return outputs + (None,) if return_topk_indices else outputs
 
     # 3. Apply Dynamic Masking Logic
     k = top_k_indices.shape[-1]
@@ -1385,7 +1417,8 @@ class DeepseekV4CSACompressor(BaseDeepseekCompressor):
           dtype=self.dtype,
       )
 
-    return compressed_kv, compressed_mask, (indexer_scores if return_indexer_scores else None)
+    outputs = (compressed_kv, compressed_mask, (indexer_scores if return_indexer_scores else None))
+    return outputs + (top_k_indices,) if return_topk_indices else outputs
 
 
 class CompressedAttention(Attention):
@@ -1830,6 +1863,7 @@ class CompressedAttention(Attention):
     compressed_kv = None
     compressed_mask = None
     compressed_segment_mask = None
+    cudnn_topk_indices = None
     decoder_segment_ids_kv = decoder_segment_ids
     compressed_segment_ids = None
 
@@ -1874,7 +1908,12 @@ class CompressedAttention(Attention):
       should_compute_loss = use_indexer and scaling_factor > 0.0 and model_mode == MODEL_MODE_TRAIN
 
       if use_indexer:
-        compressed_kv, sparse_compressed_mask, indexer_scores = self.csa_compressor(
+        is_sparse_training = self.config.indexer_sparse_training
+        is_dense_warmup = (model_mode == MODEL_MODE_TRAIN) and (scaling_factor > 0.0) and (not is_sparse_training)
+        # The cuDNN kernel consumes the indexer's selection directly (no mask -> second top-k round trip),
+        # except in dense warm-up where attention ignores the selection and uses the dense causal mask.
+        pass_topk_indices = use_cudnn_csa and not is_dense_warmup
+        compressor_outputs = self.csa_compressor(
             inputs_kv,
             q_normed,
             inputs_positions,
@@ -1885,9 +1924,11 @@ class CompressedAttention(Attention):
             use_indexer=True,
             return_indexer_scores=should_compute_loss,
             true_length=prefill_true_length,
+            return_topk_indices=pass_topk_indices,
         )
-        is_sparse_training = self.config.indexer_sparse_training
-        is_dense_warmup = (model_mode == MODEL_MODE_TRAIN) and (scaling_factor > 0.0) and (not is_sparse_training)
+        compressed_kv, sparse_compressed_mask, indexer_scores = compressor_outputs[:3]
+        if pass_topk_indices:
+          cudnn_topk_indices = compressor_outputs[3]
         use_sparse_mask = not is_dense_warmup
         compressed_mask = self.get_compressed_mask(
             inputs_positions,
@@ -1984,30 +2025,6 @@ class CompressedAttention(Attention):
     if self.query_pre_attn_scalar and self.query_pre_attn_scalar != 1.0:
       q = q * self.query_pre_attn_scalar
 
-    if use_cudnn_csa:
-      if compressed_kv is None or compressed_mask is None or self.sinks is None:
-        raise ValueError("cuDNN DSv4 CSA requires compressed KV, indexer mask, and attention sinks")
-      attn_out = dsv4_cudnn.sparse_attention_ratio4(
-          q,
-          kv,
-          compressed_kv,
-          compressed_mask,
-          self.sinks.value,
-          indexer_topk=self.config.indexer_topk,
-          window_size=self.sliding_window_size,
-      )
-    elif use_cudnn_hca:
-      if compressed_kv is None or self.sinks is None:
-        raise ValueError("cuDNN DSv4 HCA requires compressed KV and attention sinks")
-      attn_out = dsv4_cudnn.sparse_attention_hca(
-          q,
-          kv,
-          compressed_kv,
-          self.sinks.value,
-          compress_ratio=self.compress_ratio,
-          window_size=self.sliding_window_size,
-      )
-
     # Build indexer mask explicitly for tokamax splash kernel (CSA dynamic path)
     indexer_mask = None
     if (
@@ -2032,7 +2049,31 @@ class CompressedAttention(Attention):
 
     # Compute Attention
     # -> [batch, q_length, num_query_heads, head_dim]
-    if not use_cudnn_sparse:
+    if use_cudnn_csa:
+      if compressed_kv is None or compressed_mask is None or self.sinks is None:
+        raise ValueError("cuDNN DSv4 CSA requires compressed KV, indexer mask, and attention sinks")
+      attn_out = dsv4_cudnn.sparse_attention_ratio4(
+          q,
+          kv,
+          compressed_kv,
+          compressed_mask,
+          self.sinks.value,
+          indexer_topk=self.config.indexer_topk,
+          window_size=self.sliding_window_size,
+          topk_indices=cudnn_topk_indices,
+      )
+    elif use_cudnn_hca:
+      if compressed_kv is None or self.sinks is None:
+        raise ValueError("cuDNN DSv4 HCA requires compressed KV and attention sinks")
+      attn_out = dsv4_cudnn.sparse_attention_hca(
+          q,
+          kv,
+          compressed_kv,
+          self.sinks.value,
+          compress_ratio=self.compress_ratio,
+          window_size=self.sliding_window_size,
+      )
+    else:
       attn_out = self.attention_op(
           q,
           kv,
@@ -2195,16 +2236,20 @@ class CompressedAttention(Attention):
     # which is broadcast across all query heads.
     k_vec = compressed_kv[:, :, 0, :] if compressed_kv.ndim == 4 else compressed_kv
 
-    # Student scores: index_scores already contains causal future_mask and segment masking.
-    # In sparse training mode, mask non-selected blocks with DEFAULT_MASK_VALUE.
-    if sparse_loss:
-      student_scores = jnp.where(indexer_mask < (DEFAULT_MASK_VALUE / 2), DEFAULT_MASK_VALUE, indexer_score)
-    else:
-      student_scores = indexer_score
+    # The fused cuDNN backward path hands over the raw kernel outputs instead of masked scores.
+    fused_indexer = isinstance(indexer_score, dict)
 
-    safe_student_scores = jnp.where(valid_tokens_mask[:, :, None], student_scores, 0.0)
-    log_indexer_probs = jax.nn.log_softmax(safe_student_scores.astype(jnp.float32), axis=-1)
-    log_indexer_probs = jnp.where(valid_tokens_mask[:, :, None], log_indexer_probs, 0.0)
+    if not fused_indexer:
+      # Student scores: index_scores already contains causal future_mask and segment masking.
+      # In sparse training mode, mask non-selected blocks with DEFAULT_MASK_VALUE.
+      if sparse_loss:
+        student_scores = jnp.where(indexer_mask < (DEFAULT_MASK_VALUE / 2), DEFAULT_MASK_VALUE, indexer_score)
+      else:
+        student_scores = indexer_score
+
+      safe_student_scores = jnp.where(valid_tokens_mask[:, :, None], student_scores, 0.0)
+      log_indexer_probs = jax.nn.log_softmax(safe_student_scores.astype(jnp.float32), axis=-1)
+      log_indexer_probs = jnp.where(valid_tokens_mask[:, :, None], log_indexer_probs, 0.0)
 
     # Query is already scaled by softmax_scale in compressed_query_projection; do not scale again
     head_chunk_size = getattr(self.config, "csa_qk_head_chunk_size", 0)
@@ -2246,6 +2291,20 @@ class CompressedAttention(Attention):
     # L1 normalize aggregated target distribution across compressed blocks
     target_probs = jnp.where(valid_tokens_mask[:, :, None], target_probs, 0.0)
     target_probs = target_probs / (jnp.sum(target_probs, axis=-1, keepdims=True) + EPS)
+
+    if fused_indexer:
+      # KL(attention || indexer) summed over tokens; its backward is the fused cuDNN indexer kernel.
+      if sparse_loss:
+        # The teacher is zero outside the selected valid blocks; the student is a softmax over the selected
+        # slots only, so hand the kernel the teacher gathered at the selection (0 for invalid slots).
+        selected = indexer_score["topk_indices"]
+        target_selected = jnp.take_along_axis(target_probs, jnp.maximum(selected, 0), axis=-1)
+        target_selected = jnp.where(selected >= 0, target_selected, 0.0)
+        kl_sum = dsv4_cudnn.indexer_sparse_kl_loss_ratio4(indexer_score, target_selected, eps=EPS)
+      else:
+        kl_sum = dsv4_cudnn.indexer_kl_loss_ratio4(indexer_score, target_probs, eps=EPS)
+      num_valid_tokens = jnp.maximum(jnp.sum(valid_tokens_mask.astype(jnp.float32)), 1.0)
+      return (kl_sum / num_valid_tokens) * scaling_factor
 
     # KL Divergence: KL(attention || indexer)
     log_target_probs = jnp.log(target_probs + EPS)
