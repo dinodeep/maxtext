@@ -739,6 +739,7 @@ class DeepSeekV4GroupedLinear(nnx.Module):
       kernel_axes: tuple[None | str, ...] = ("groups", "embed", "mlp"),
       matmul_precision: str = "default",
       parameter_memory_host_offload: bool = False,
+      quant: None | Quant = None,
       *,
       rngs: nnx.Rngs,
   ):
@@ -754,6 +755,9 @@ class DeepSeekV4GroupedLinear(nnx.Module):
       kernel_axes: logical axes for partitioning the kernel.
       matmul_precision: Precision for matrix multiplication.
       parameter_memory_host_offload: Determines whether to offload params to host
+      quant: quantization config, defaults to None implying no quantization. Quantized
+        dot_generals (e.g. TransformerEngine MXFP8) take no batch dimensions, so each group
+        runs its own quantized GEMM, as DenseGeneral would, against its slice of the kernel.
       rngs: RNG state for initialization in nnx.
     """
     if out_features % n_groups != 0:
@@ -791,11 +795,31 @@ class DeepSeekV4GroupedLinear(nnx.Module):
         sharding=self.kernel_axes,
     )
 
-  def __call__(self, inputs: Array) -> Array:
+    self.quant = quant
+    self._quant_dot_general_names = ()
+    if quant and not isinstance(quant, quantizations.ServeFp8WeightQuantization):
+      names = []
+      for group in range(self.n_groups):
+        base_name, quant_dot_general = quantizations.make_dot_general(quant, self.kernel_axes[1:], rngs)
+        name = f"{base_name}_group{group}"
+        setattr(self, name, quant_dot_general)
+        names.append(name)
+      self._quant_dot_general_names = tuple(names)
+      if isinstance(getattr(self, names[0]), nnx_wrappers.ToNNX):
+        # A bridged Linen quantizer creates its state on the first call.
+        block_size = getattr(quant, "get_block_size", lambda: 1)()  # needed for TE MXFP8
+        dummy_inputs = jnp.zeros((block_size, self.n_groups, self.in_features_per_group), dtype=self.dtype)
+        self(dummy_inputs, _initializing=True)
+        if not quant.needs_apply_rngs:
+          for name in self._quant_dot_general_names:
+            getattr(self, name).release_rngs()
+
+  def __call__(self, inputs: Array, _initializing: bool = False) -> Array:
     """Applies a batched grouped linear transformation to the inputs.
 
     Args:
       inputs: The nd-array to be transformed. Expected shape is `[..., n_groups, in_features_per_group]`.
+      _initializing: Whether the quantized dot_generals are being initialized.
 
     Returns:
       The transformed input of shape `[..., n_groups, out_features_per_group]`.
@@ -808,6 +832,22 @@ class DeepSeekV4GroupedLinear(nnx.Module):
       max_logging.log("linear.py: Moving parameter grouped_linear kernel to device")
       kernel = jax.device_put(kernel, max_utils.device_space())
     kernel = jnp.asarray(kernel, self.dtype)
+
+    if self._quant_dot_general_names:
+      # [..., i] x [i, o] -> [..., o] per group, stacked back to [..., g, o].
+      outputs = [
+          _compute_dot_general_nnx(
+              inputs[..., group, :],
+              kernel[group],
+              (inputs.ndim - 2,),
+              (0,),
+              self.matmul_precision,
+              getattr(self, name),
+              _initializing,
+          )
+          for group, name in enumerate(self._quant_dot_general_names)
+      ]
+      return jnp.stack(outputs, axis=-2)
 
     # Perform a batched matrix multiplication using einsum with explicit precision.
     # We use jnp.einsum instead of explicitly flattening and using lax.dot_general

@@ -1601,6 +1601,7 @@ class CompressedAttention(Attention):
         dtype=self.dtype,
         weight_dtype=self.weight_dtype,
         matmul_precision=self.config.matmul_precision,
+        quant=self.quant,
         rngs=self.rngs,
     )
 
