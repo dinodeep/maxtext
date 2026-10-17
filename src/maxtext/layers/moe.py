@@ -4895,6 +4895,11 @@ class RoutedMoE(nnx.Module):
     )
 
     checkpoint_kwargs = _get_te_moe_checkpoint_kwargs(te_moe.moe)
+    # MaxText stores the prefused wi as standard [E, K, 2N] (contiguous gate/up halves). TE can't
+    # infer this when K == 2N (e.g. emb_dim=4096, moe_mlp_dim=2048), so state it explicitly.
+    layout_kwargs = {}
+    if "cudnn_native_weight_layout" in inspect.signature(te_moe.moe).parameters:
+      layout_kwargs["cudnn_native_weight_layout"] = False
 
     output, lb_loss, total_recv_tokens = te_moe.moe(
         inputs,
@@ -4925,6 +4930,7 @@ class RoutedMoE(nnx.Module):
         recv_capacity_per_rank=max_utils.get_te_moe_recv_capacity_per_rank(),
         quant_before_fsdp_ag=self.config.te_moe_quantize_before_fsdp_all_gather,
         **checkpoint_kwargs,
+        **layout_kwargs,
     )
     recv_capacity_per_rank = max_utils.get_te_moe_recv_capacity_per_rank()
     output = output.astype(self.dtype)
