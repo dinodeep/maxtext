@@ -2543,7 +2543,7 @@ class NNXDecoder(nnx.Module):
     # 1. Unrolled prefix layers (0, 1, 2)
     is_training = model_mode == MODEL_MODE_TRAIN
     has_remat_policy = cfg.remat_policy is not None and cfg.remat_policy != "none"
-    use_remat = is_training and has_remat_policy
+    use_remat = False
     remat_policy_fn, prevent_cse = self._get_deepseek4_remat_policy_and_cse() if use_remat else (None, None)
     for layer_idx in range(num_hash_layers):
       layer = getattr(self, f"layers_{layer_idx}")
@@ -2583,7 +2583,6 @@ class NNXDecoder(nnx.Module):
           model_mode,
           length=num_full_blocks,
           metadata_axis_name="scanned_blocks",
-          skip_block_remat=True,
           **layer_call_kwargs,
       )
 

@@ -279,7 +279,7 @@ class DeepSeek4ScannableBlock(nnx.Module):
     inputs = checkpoint_name(inputs, "decoder_layer_input")
     y = inputs
 
-    if model_mode == "train" and bool(self.config.remat_policy) and self.config.remat_policy != "none":
+    if False:  # revert per-layer remat; block-level remat restored in nnx_decoders
       call_kwargs = dict(  # pylint: disable=use-dict-literal
           decoder_segment_ids=decoder_segment_ids,
           decoder_positions=decoder_positions,
