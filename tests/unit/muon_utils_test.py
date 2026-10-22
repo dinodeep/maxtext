@@ -18,16 +18,20 @@
 
 import contextlib
 import io
+import os
 import unittest
 from unittest import mock
 
+from absl.testing import parameterized
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax import nnx
 from optax.contrib._muon import MuonDimensionNumbers as mdn
 
-from maxtext.utils import muon_utils
+from maxtext.configs import pyconfig
+from maxtext.utils import maxtext_utils, model_creation_utils, muon_utils
+from maxtext.utils.globals import MAXTEXT_PKG_DIR
 
 
 class TestIsPathContainAny(unittest.TestCase):
@@ -592,6 +596,139 @@ class TestLayerScanInvariance(unittest.TestCase):
     )
     self.assertEqual(out_unscanned_shape[out_mdn.output_axis[0]], 512)
     self.assertEqual(out_scanned_shape[out_mdn.output_axis[0]], 512)
+
+
+def _scanned_param(shape, scan_axis, logical_axes, partition_name="layers"):
+  """An nnx.Param carrying the scan metadata `nnx_scan.create_scanned_layers` attaches."""
+  return nnx.Param(
+      jnp.zeros(shape),
+      sharding_names=logical_axes,
+      **{nnx.PARTITION_NAME: partition_name, "param_scan_axis": scan_axis},
+  )
+
+
+class TestScanAxes(unittest.TestCase):
+  """get_scan_axes reads the layer axes of a scanned parameter from its metadata."""
+
+  def test_unscanned_param_has_no_scan_axes(self):
+    self.assertEqual(muon_utils.get_scan_axes(nnx.Param(jnp.zeros((4, 8)))), ())
+
+  def test_scan_axis_comes_from_metadata(self):
+    self.assertEqual(muon_utils.get_scan_axes(_scanned_param((3, 4, 8), 0, ("layers", "embed", "mlp"))), (0,))
+    self.assertEqual(muon_utils.get_scan_axes(_scanned_param((4, 3, 8), 1, ("embed", "layers", "mlp"))), (1,))
+
+  def test_nested_block_scan_adds_the_local_layers_axis(self):
+    param = _scanned_param((2, 3, 4, 8), 0, ("layers", "local_layers", "embed", "mlp"))
+    self.assertEqual(muon_utils.get_scan_axes(param), (0, 1))
+    param = _scanned_param((4, 2, 3, 8), 1, ("embed", "layers", "local_layers", "mlp"))
+    self.assertEqual(muon_utils.get_scan_axes(param), (1, 2))
+
+  def test_inner_scan_alone_is_a_single_axis(self):
+    param = _scanned_param((3, 4, 8), 0, ("local_layers", "embed", "mlp"), partition_name="local_layers")
+    self.assertEqual(muon_utils.get_scan_axes(param), (0,))
+
+  def test_stack_too_low_rank_for_the_scan_axis_keeps_it_in_front(self):
+    self.assertEqual(muon_utils.get_scan_axes(_scanned_param((3,), 1, ("layers",))), (0,))
+
+
+class TestToStackedLayout(unittest.TestCase):
+  """to_stacked_layout maps feature-axis dimension numbers onto the stacked layout."""
+
+  def test_identity_without_scan_axes_or_numbers(self):
+    self.assertEqual(muon_utils.to_stacked_layout(mdn((0,), (-1,)), 2, ()), mdn((0,), (-1,)))
+    self.assertIsNone(muon_utils.to_stacked_layout(None, 3, (0,)))
+
+  def test_scan_axis_1_leaves_the_numbers_unchanged(self):
+    self.assertEqual(muon_utils.to_stacked_layout(mdn((0,), (-1,)), 3, (1,)), mdn((0,), (-1,)))
+    self.assertEqual(muon_utils.to_stacked_layout(mdn((0, -2), (-1,)), 4, (1,)), mdn((0, -2), (-1,)))
+
+  def test_scan_axis_0_shifts_the_leading_feature_axes(self):
+    # [layers, in, out]: reduce over `in`, not over the layers.
+    self.assertEqual(muon_utils.to_stacked_layout(mdn((0,), (-1,)), 3, (0,)), mdn((1,), (-1,)))
+    # [layers, heads, head_dim, out]
+    self.assertEqual(muon_utils.to_stacked_layout(mdn((0, -2), (-1,)), 4, (0,)), mdn((1, -2), (-1,)))
+    # [layers, experts, in, out]
+    self.assertEqual(muon_utils.to_stacked_layout(mdn((-2,), (-1,)), 4, (0,)), mdn((-2,), (-1,)))
+
+  def test_stacked_vectors_are_left_alone(self):
+    # [layers, features]: one feature axis, so reduction and output cannot both be feature axes.
+    self.assertEqual(muon_utils.to_stacked_layout(mdn((0,), (-1,)), 2, (0,)), mdn((0,), (-1,)))
+
+  def test_nested_scan_axes(self):
+    # [blocks, local, in, out] and [in, blocks, local, out]
+    self.assertEqual(muon_utils.to_stacked_layout(mdn((0,), (-1,)), 4, (0, 1)), mdn((2,), (-1,)))
+    self.assertEqual(muon_utils.to_stacked_layout(mdn((0,), (-1,)), 4, (1, 2)), mdn((0,), (-1,)))
+
+
+class _ScannedNNXModel(nnx.Module):
+  """Layers stacked on axis 0, as `param_scan_axis=0` lays them out."""
+
+  def __init__(self):
+    self.layers = nnx.Module()
+    self.layers.mlp = _scanned_param((3, 4, 8), 0, ("layers", "embed", "mlp"))
+    self.layers.self_attention = nnx.Module()
+    self.layers.self_attention.out = _scanned_param((3, 2, 4, 8), 0, ("layers", "heads", "kv", "embed"))
+
+
+class TestScannedNNXModel(unittest.TestCase):
+  """get_muon_weight_dimension_numbers never reduces over a scanned parameter's layer axis."""
+
+  def test_layer_axis_is_skipped(self):
+    result = muon_utils.get_muon_weight_dimension_numbers(_ScannedNNXModel(), config=None)
+    self.assertEqual(result["layers"]["mlp"], mdn((1,), (-1,)))
+    self.assertEqual(result["layers"]["self_attention"]["out"], mdn((1, -2), (-1,)))
+
+
+def _dimension_numbers_by_path(model_name, param_scan_axis):
+  """Returns {path: (shape, Muon dimension numbers)} for every parameter of `model_name`."""
+  config = pyconfig.initialize(
+      [
+          None,
+          os.path.join(MAXTEXT_PKG_DIR, "configs", "base.yml"),
+          f"model_name={model_name}",
+          f"param_scan_axis={param_scan_axis}",
+          "attention=dot_product",
+          "skip_jax_distributed_system=True",
+          # A layer count unlike any feature dim, so that indexing a layer axis cannot pass for a feature axis.
+          "override_model_config=True",
+          "base_num_decoder_layers=20",
+      ]
+  )
+  mesh = jax.sharding.Mesh(maxtext_utils.create_device_mesh(config), config.mesh_axes)
+  _, model = model_creation_utils.create_nnx_abstract_model(config, mesh)
+  _, params, _ = nnx.split(model, nnx.Param, ...)
+  shapes = {tuple(path): variable.get_value().shape for path, variable in nnx.to_flat_state(params)}
+  dimension_numbers, _ = jax.tree_util.tree_flatten_with_path(
+      nnx.to_pure_dict(muon_utils.get_muon_weight_dimension_numbers(model, config)),
+      is_leaf=lambda x: x is None or isinstance(x, mdn),
+  )
+  return {muon_utils.key_path(path): (shapes[muon_utils.key_path(path)], dim) for path, dim in dimension_numbers}
+
+
+class TestScannedLayoutDimensionNumbers(parameterized.TestCase):
+  """Muon reduces over the same feature axes of a real model whatever its param_scan_axis."""
+
+  @parameterized.parameters("llama2-7b", "qwen3-30b-a3b", "qwen3-next-80b-a3b", "deepseek3-test")
+  def test_feature_axes_match_across_scan_axes(self, model_name):
+    layer_major = _dimension_numbers_by_path(model_name, param_scan_axis=0)
+    feature_major = _dimension_numbers_by_path(model_name, param_scan_axis=1)
+    self.assertEqual(layer_major.keys(), feature_major.keys())
+
+    def sizes(shape, axes):
+      return tuple(shape[axis] for axis in axes)
+
+    remapped = 0
+    for path, (shape, dim) in layer_major.items():
+      reference_shape, reference_dim = feature_major[path]
+      with self.subTest(path=path):
+        self.assertEqual(dim is None, reference_dim is None)
+        if dim is None:
+          continue
+        self.assertEqual(sizes(shape, dim.reduction_axis), sizes(reference_shape, reference_dim.reduction_axis))
+        self.assertEqual(sizes(shape, dim.output_axis), sizes(reference_shape, reference_dim.output_axis))
+        remapped += dim != reference_dim
+    # The scanned parameters' dimension numbers do move with the layer axis.
+    self.assertGreater(remapped, 0)
 
 
 if __name__ == "__main__":
