@@ -113,22 +113,18 @@ class MaxUtilsT5XCrossEntropy(unittest.TestCase):
     # Compare total loss aggregation
     self.assertTrue(jnp.allclose(total_loss_with_z, total_loss_no_z + z_loss_only, rtol=1e-5, atol=1e-8))
 
-  def test_recompute_softmax_matches_saved_softmax(self):
-    """Recomputing the softmax in the backward pass gives the same loss and gradients."""
+  def test_cross_entropy_gradient(self):
+    """The custom gradient matches optax's and keeps the logits' dtype."""
     logits = random.normal(random.PRNGKey(0), (2, 3, 50))
-    one_hot_targets = jax.nn.one_hot(random.randint(random.PRNGKey(1), (2, 3), 0, 50), 50)
+    targets = random.randint(random.PRNGKey(1), (2, 3), 0, 50)
+    one_hot_targets = jax.nn.one_hot(targets, 50)
 
-    def loss(logits, recompute_softmax):
-      xent, z_loss = max_utils.cross_entropy_with_logits(
-          logits, one_hot_targets, z_loss=1e-4, recompute_softmax=recompute_softmax
-      )
-      return jnp.sum(xent), z_loss
+    def loss(logits):
+      return jnp.sum(max_utils.cross_entropy_with_logits(logits, one_hot_targets, 0.0)[0])
 
-    (saved_loss, saved_z), saved_grad = jax.value_and_grad(loss, has_aux=True)(logits, False)
-    (recomputed_loss, recomputed_z), recomputed_grad = jax.value_and_grad(loss, has_aux=True)(logits, True)
-    np.testing.assert_allclose(recomputed_loss, saved_loss, rtol=1e-6)
-    np.testing.assert_allclose(recomputed_z, saved_z, rtol=1e-6)
-    np.testing.assert_allclose(recomputed_grad, saved_grad, rtol=1e-5, atol=1e-7)
+    expected = jax.grad(lambda l: jnp.sum(optax.softmax_cross_entropy_with_integer_labels(l, targets)))(logits)
+    np.testing.assert_allclose(jax.grad(loss)(logits), expected, rtol=1e-5, atol=1e-7)
+    self.assertEqual(jax.grad(loss)(logits.astype(jnp.bfloat16)).dtype, jnp.bfloat16)
 
 
 class MaxUtilsCustomMesh(unittest.TestCase):
