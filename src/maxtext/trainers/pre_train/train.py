@@ -85,7 +85,7 @@ from maxtext.utils import maxtext_utils_nnx
 from maxtext.utils import train_utils
 from maxtext.utils import mllog_utils
 from maxtext.utils import gpu_collective_overlap_pass
-from maxtext.utils.gradient_accumulation import gradient_accumulation_loss_and_grad
+from maxtext.utils.gradient_accumulation import gradient_accumulation_loss_and_grad, model_loop_unroll_context
 from maxtext.utils.vocabulary_tiling import vocab_tiling_nnx_loss
 
 
@@ -260,7 +260,12 @@ def loss_fn(model, config, data, dropout_rng, params, sparsity_state=None, is_tr
           data["targets_segmentation"] != 0,
       )
     one_hot_targets = _one_hot_targets(data["targets"], config, model.mesh)
-    xent, z_loss = max_utils.cross_entropy_with_logits(logits, one_hot_targets, z_loss=config.z_loss_multiplier)
+    xent, z_loss = max_utils.cross_entropy_with_logits(
+        logits,
+        one_hot_targets,
+        z_loss=config.z_loss_multiplier,
+        recompute_softmax=config.cross_entropy_recompute_softmax,
+    )
 
     xent = sharding.maybe_shard_with_logical(
         xent,
@@ -589,7 +594,9 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       return loss, (aux, non_param_rest)
 
     grad_func = jax.value_and_grad(diff_wrapper, argnums=(0, 1), has_aux=True)
-    (loss, (aux, non_param_rest)), (raw_grads, custom_grads) = grad_func(curr_params, custom_params, rest, config, data)
+    # Mark the model's loops for double buffering without GA too, as gradient_accumulation does per microbatch.
+    with model_loop_unroll_context(config):
+      (loss, (aux, non_param_rest)), (raw_grads, custom_grads) = grad_func(curr_params, custom_params, rest, config, data)
     nnx.update(state.model, nnx.State.merge(custom_grads, non_param_rest))
 
   raw_grads = jax.tree_util.tree_map(
