@@ -16,6 +16,7 @@
 
 # pylint: disable=too-many-positional-arguments
 
+import functools
 import unittest
 from dataclasses import dataclass
 
@@ -27,6 +28,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from qwix._src.core import qarray
 
 from maxtext.common.common_types import ShardMode
+from maxtext.utils import ga_inplace
 from maxtext.utils import gradient_accumulation
 
 
@@ -416,6 +418,124 @@ class TestGradientAccumulationNNX(unittest.TestCase):
           for gradient in jax.tree.leaves(raw_grads):
             self.assertTrue(jnp.all(jnp.isfinite(gradient)))
             self.assertTrue(jnp.all(gradient == 0))
+
+
+class _ScannedStack(nnx.Module):
+  """A stack of tanh(h @ kernel + bias) layers, stored like `_create_scanned_layers` stores one."""
+
+  def __init__(self, num_layers, dim, param_scan_axis, rngs):
+    metadata = {nnx.PARTITION_NAME: "layers", "param_scan_axis": param_scan_axis}
+    kernel = 0.3 * jax.random.normal(rngs.params(), (num_layers, dim, dim))
+    bias = 0.1 * jax.random.normal(rngs.params(), (num_layers, dim))
+    self.kernel = nnx.Param(jnp.moveaxis(kernel, 0, param_scan_axis), **metadata)
+    self.bias = nnx.Param(jnp.moveaxis(bias, 0, param_scan_axis), **metadata)
+
+
+class _ScannedNNX(nnx.Module):
+  """Applies `decoder.layers` with a layer scan that, like NNXDecoder's, accumulates in place."""
+
+  def __init__(self, param_scan_axis, inplace_scan=True, num_layers=3, dim=2, rngs=None):
+    self.decoder = nnx.Module()
+    self.decoder.layers = _ScannedStack(num_layers, dim, param_scan_axis, rngs)
+    self.param_scan_axis = param_scan_axis
+    self.inplace_scan = inplace_scan
+
+  def __call__(self, x):
+    axis = self.param_scan_axis
+    params = nnx.state(self.decoder.layers, nnx.Param)
+    params = jax.tree.map(lambda p: jnp.moveaxis(p, axis, 0) if p.ndim > axis else p, params)
+
+    def layer(h, layer_params):
+      return jnp.tanh(h @ layer_params["kernel"].get_value() + layer_params["bias"].get_value())
+
+    name = ga_inplace.stack_name(params)
+    acc = ga_inplace.lookup(name) if self.inplace_scan else None
+    if acc is None or not ga_inplace.stacks(params, acc, axis):
+      h, _ = jax.lax.scan(lambda h, p: (layer(h, p), None), x, params)
+      return h
+
+    def ga_layer(carry, xs):
+      h, a = carry
+      a = jax.lax.optimization_barrier(a)
+      layer_params, i = xs
+      layer_params = ga_inplace.inject_layer_params(layer_params, a, i, axis)
+      return (layer(h, layer_params), a), None
+
+    num_layers = jax.tree.leaves(params)[0].shape[0]
+    (h, acc_final), _ = jax.lax.scan(ga_layer, (x, acc), (params, jnp.arange(num_layers)))
+    ga_inplace.set_final(name, acc_final)
+    return h
+
+
+class TestInPlaceGradientAccumulation(unittest.TestCase):
+  """Scanned stacks accumulate their gradients in place, at any param_scan_axis."""
+
+  def setUp(self):
+    self.cfg = _Cfg(gradient_accumulation_steps=2)
+    self.data = {
+        "inputs": jnp.arange(8.0).reshape(4, 2) / 8.0,
+        "targets": jnp.ones((4, 2)),
+    }
+
+  def _ga_and_direct(self, model):
+    """Returns the GA loss and gradients, and those of the whole batch at once."""
+    _, params, _ = nnx.split(model, nnx.Param, ...)
+    ns = NamedSharding(Mesh(np.array(jax.local_devices()[:1]), ("x",)), PartitionSpec())
+    loss, _, raw_grads = gradient_accumulation.gradient_accumulation_loss_and_grad(
+        _fake_loss_fn,
+        self.cfg,
+        model,
+        params=None,
+        params_shardings=jax.tree.map(lambda _: ns, params),
+        data=self.data,
+        dropout_rng=None,
+    )
+
+    def direct_loss(model):
+      return jnp.mean(jnp.mean((model(self.data["inputs"]) - self.data["targets"]) ** 2, axis=-1))
+
+    expected_loss, expected_grads = nnx.value_and_grad(direct_loss)(model)
+    return loss, raw_grads, expected_loss, expected_grads
+
+  def _assert_matches_full_batch(self, model):
+    loss, raw_grads, expected_loss, expected_grads = self._ga_and_direct(model)
+    np.testing.assert_allclose(loss, expected_loss, rtol=1e-6)
+    for name in ("kernel", "bias"):
+      np.testing.assert_allclose(
+          raw_grads["decoder"]["layers"][name].get_value(),
+          expected_grads["decoder"]["layers"][name].get_value(),
+          rtol=1e-5,
+          atol=1e-7,
+      )
+
+  def test_matches_full_batch_at_any_param_scan_axis(self):
+    for param_scan_axis in (0, 1):
+      with self.subTest(param_scan_axis=param_scan_axis):
+        self._assert_matches_full_batch(_ScannedNNX(param_scan_axis, rngs=nnx.Rngs(0)))
+
+  def test_stack_whose_scan_does_not_pick_up_its_accumulator(self):
+    """A stack applied by a scan that does not accumulate in place accumulates as usual."""
+    self._assert_matches_full_batch(_ScannedNNX(0, inplace_scan=False, rngs=nnx.Rngs(0)))
+
+  def test_stack_paths_and_names(self):
+    """A stack is found by the scan name its parameters carry."""
+    model = _ScannedNNX(1, rngs=nnx.Rngs(0))
+    _, params, _ = nnx.split(model, nnx.Param, ...)
+    self.assertEqual(ga_inplace.stack_paths(params), {"layers": ("decoder", "layers")})
+    self.assertEqual(ga_inplace.stack_name(nnx.state(model.decoder.layers, nnx.Param)), "layers")
+    self.assertIsNone(ga_inplace.stack_name(nnx.state(_TinyNNX(nnx.Rngs(0)), nnx.Param)))
+
+  def test_inject_routes_the_layer_cotangent_along_the_scan_axis(self):
+    for param_scan_axis in (0, 1):
+      with self.subTest(param_scan_axis=param_scan_axis):
+        acc = jnp.moveaxis(jnp.arange(24.0).reshape(3, 2, 4), 0, param_scan_axis)
+        w = jnp.ones((2, 4))
+        inject = functools.partial(ga_inplace.inject_layer_params, i=1, param_scan_axis=param_scan_axis)
+        _, vjp = jax.vjp(lambda w_, a, inject=inject: inject(w_, a), w, acc)
+        ct_w, ct_acc = vjp(jnp.full((2, 4), 5.0))
+        np.testing.assert_array_equal(ct_w, jnp.zeros((2, 4)))
+        expected = jnp.zeros((3, 2, 4)).at[1].set(5.0)
+        np.testing.assert_array_equal(ct_acc, jnp.moveaxis(expected, 0, param_scan_axis))
 
 
 if __name__ == "__main__":
