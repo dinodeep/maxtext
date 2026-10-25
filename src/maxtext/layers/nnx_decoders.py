@@ -1880,7 +1880,13 @@ class NNXDecoder(nnx.Module):
       # Use the transpose of embedding matrix for logit transform.
       embedding_table = shared_embedding.embedding[...]
       attend_dtype = jnp.float32 if cfg.logits_dot_in_fp32 else cfg.dtype
-      logits = attend_on_embedding(y, embedding_table, attend_dtype, self.config, out_sharding)
+      # Release the head's input and embedding cotangents together, so the backward pass does not keep
+      # the [batch, length, vocab] dlogits alive until the embedding-gradient matmul (see max_utils.tie_cotangents).
+      logits = max_utils.tie_cotangents(
+          lambda y_, table_: attend_on_embedding(y_, table_, attend_dtype, self.config, out_sharding),
+          y,
+          embedding_table,
+      )
 
       if self.config.normalize_embedding_logits:
         # Correctly normalize pre-softmax logits for this shared case.
