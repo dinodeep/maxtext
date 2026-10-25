@@ -127,6 +127,27 @@ class MaxUtilsT5XCrossEntropy(unittest.TestCase):
     self.assertEqual(jax.grad(loss)(logits.astype(jnp.bfloat16)).dtype, jnp.bfloat16)
 
 
+class MaxUtilsTieCotangents(unittest.TestCase):
+  """Tests for tie_cotangents in max_utils.py"""
+
+  def test_tie_cotangents_matches_untied(self):
+    """Tying the cotangents changes neither the output nor the gradients."""
+    x = random.normal(random.PRNGKey(0), (4, 8))
+    w = {"kernel": random.normal(random.PRNGKey(1), (8, 16))}
+
+    def f(x, w):
+      return jnp.tanh(x @ w["kernel"])
+
+    def loss(x, w, tie):
+      y = max_utils.tie_cotangents(f, x, w) if tie else f(x, w)
+      return jnp.sum(y**2)
+
+    np.testing.assert_array_equal(max_utils.tie_cotangents(f, x, w), f(x, w))
+    tied_grads = jax.grad(loss, argnums=(0, 1))(x, w, True)
+    untied_grads = jax.grad(loss, argnums=(0, 1))(x, w, False)
+    jax.tree.map(np.testing.assert_allclose, tied_grads, untied_grads)
+
+
 class MaxUtilsCustomMesh(unittest.TestCase):
   """Tests for the is_valid_custom_mesh function in max_utils.py"""
 

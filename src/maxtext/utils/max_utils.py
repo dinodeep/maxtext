@@ -624,6 +624,28 @@ def unbox_logicallypartioned(boxed_pytree):
   )
 
 
+def tie_cotangents(f, *args):
+  """Returns f(*args); in the backward pass, all input cotangents are released together.
+
+  The optimization barrier makes each input cotangent available only once all of them are computed,
+  so XLA cannot defer computing one of them (e.g. a weight gradient) and keep the large output
+  cotangent it consumes alive across the rest of the backward pass.
+  """
+
+  @jax.custom_vjp
+  def tied(*a):
+    return f(*a)
+
+  def tied_fwd(*a):
+    return jax.vjp(f, *a)
+
+  def tied_bwd(vjp_fn, ct):
+    return jax.lax.optimization_barrier(vjp_fn(ct))
+
+  tied.defvjp(tied_fwd, tied_bwd)
+  return tied(*args)
+
+
 # Cross entropy implementation is taken from original T5X codebase:
 # https://github.com/google-research/t5x/blob/ace831eea1e2742b4299cd1a9af7e4f302038351/t5x/losses.py#L25-L101
 @jax.custom_vjp

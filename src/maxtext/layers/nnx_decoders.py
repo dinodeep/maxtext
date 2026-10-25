@@ -84,29 +84,6 @@ _FSDP_MESH_AXES = ("fsdp", "fsdp_transpose")
 _GATHERED_FSDP_WEIGHT = "gathered_fsdp_weight"
 
 
-def _tie_cotangents(f, *args):
-  """Returns f(*args); in the backward pass, all input cotangents are released together.
-
-  The optimization barrier makes the input cotangent (which the rest of the backward pass
-  consumes) available only once the weight cotangent is computed too, so XLA cannot defer the
-  weight-gradient matmul and keep its large output cotangent (e.g. the [batch, length, vocab]
-  dlogits) alive across the rest of the backward pass.
-  """
-
-  @jax.custom_vjp
-  def tied(*a):
-    return f(*a)
-
-  def tied_fwd(*a):
-    return jax.vjp(f, *a)
-
-  def tied_bwd(vjp_fn, ct):
-    return jax.lax.optimization_barrier(vjp_fn(ct))
-
-  tied.defvjp(tied_fwd, tied_bwd)
-  return tied(*args)
-
-
 def _drop_fsdp_mesh_axes(entry):
   """Return one PartitionSpec entry with the FSDP mesh axes removed."""
   if entry is None:
@@ -1918,9 +1895,9 @@ class NNXDecoder(nnx.Module):
             y, head_in_axes, self.mesh, cfg.shard_mode, debug_sharding=cfg.debug_sharding
         )
       # Release the head's input and weight cotangents together, so the backward pass does not keep
-      # the [batch, length, vocab] dlogits alive until the weight-gradient matmul (see _tie_cotangents).
+      # the [batch, length, vocab] dlogits alive until the weight-gradient matmul (see max_utils.tie_cotangents).
       head_graphdef, head_state = nnx.split(self.logits_dense)
-      logits = _tie_cotangents(
+      logits = max_utils.tie_cotangents(
           lambda y_, state_: nnx.merge(head_graphdef, state_)(y_, out_sharding=out_sharding), y, head_state
       )
 
