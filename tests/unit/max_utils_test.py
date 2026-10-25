@@ -131,21 +131,24 @@ class MaxUtilsTieCotangents(unittest.TestCase):
   """Tests for tie_cotangents in max_utils.py"""
 
   def test_tie_cotangents_matches_untied(self):
-    """Tying the cotangents changes neither the output nor the gradients."""
+    """Tying the cotangents changes neither the values nor the gradients, and adds the barrier."""
     x = random.normal(random.PRNGKey(0), (4, 8))
     w = {"kernel": random.normal(random.PRNGKey(1), (8, 16))}
 
-    def f(x, w):
-      return jnp.tanh(x @ w["kernel"])
-
     def loss(x, w, tie):
-      y = max_utils.tie_cotangents(f, x, w) if tie else f(x, w)
-      return jnp.sum(y**2)
+      if tie:
+        x, w = max_utils.tie_cotangents(x, w)
+      return jnp.sum(jnp.tanh(x @ w["kernel"]) ** 2)
 
-    np.testing.assert_array_equal(max_utils.tie_cotangents(f, x, w), f(x, w))
+    tied_x, tied_w = max_utils.tie_cotangents(x, w)
+    np.testing.assert_array_equal(tied_x, x)
+    np.testing.assert_array_equal(tied_w["kernel"], w["kernel"])
+    np.testing.assert_array_equal(max_utils.tie_cotangents(x), x)
     tied_grads = jax.grad(loss, argnums=(0, 1))(x, w, True)
     untied_grads = jax.grad(loss, argnums=(0, 1))(x, w, False)
-    jax.tree.map(np.testing.assert_allclose, tied_grads, untied_grads)
+    jax.tree.map(np.testing.assert_array_equal, tied_grads, untied_grads)
+    tied_grad_jaxpr = jax.make_jaxpr(jax.grad(lambda x, w: loss(x, w, True), argnums=(0, 1)))(x, w)
+    self.assertIn("optimization_barrier", str(tied_grad_jaxpr))
 
 
 class MaxUtilsCustomMesh(unittest.TestCase):

@@ -1882,11 +1882,8 @@ class NNXDecoder(nnx.Module):
       attend_dtype = jnp.float32 if cfg.logits_dot_in_fp32 else cfg.dtype
       # Release the head's input and embedding cotangents together, so the backward pass does not keep
       # the [batch, length, vocab] dlogits alive until the embedding-gradient matmul (see max_utils.tie_cotangents).
-      logits = max_utils.tie_cotangents(
-          lambda y_, table_: attend_on_embedding(y_, table_, attend_dtype, self.config, out_sharding),
-          y,
-          embedding_table,
-      )
+      y_head, head_table = max_utils.tie_cotangents(y, embedding_table)
+      logits = attend_on_embedding(y_head, head_table, attend_dtype, self.config, out_sharding)
 
       if self.config.normalize_embedding_logits:
         # Correctly normalize pre-softmax logits for this shared case.
@@ -1903,9 +1900,8 @@ class NNXDecoder(nnx.Module):
       # Release the head's input and weight cotangents together, so the backward pass does not keep
       # the [batch, length, vocab] dlogits alive until the weight-gradient matmul (see max_utils.tie_cotangents).
       head_graphdef, head_state = nnx.split(self.logits_dense)
-      logits = max_utils.tie_cotangents(
-          lambda y_, state_: nnx.merge(head_graphdef, state_)(y_, out_sharding=out_sharding), y, head_state
-      )
+      y_head, head_state = max_utils.tie_cotangents(y, head_state)
+      logits = nnx.merge(head_graphdef, head_state)(y_head, out_sharding=out_sharding)
 
     if self.config.cast_logits_to_fp32:
       logits = logits.astype(jnp.float32)
