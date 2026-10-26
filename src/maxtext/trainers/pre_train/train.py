@@ -95,7 +95,7 @@ from maxtext.utils import sharding
 from maxtext.utils import maxtext_utils_nnx
 from maxtext.utils import train_utils
 from maxtext.utils import mllog_utils
-from maxtext.utils.gradient_accumulation import gradient_accumulation_loss_and_grad
+from maxtext.utils.gradient_accumulation import gradient_accumulation_loss_and_grad, model_loop_unroll_context
 from maxtext.utils.vocabulary_tiling import vocab_tiling_nnx_loss
 
 
@@ -599,7 +599,9 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
       return loss, (aux, non_param_rest)
 
     grad_func = jax.value_and_grad(diff_wrapper, argnums=(0, 1), has_aux=True)
-    (loss, (aux, non_param_rest)), (raw_grads, custom_grads) = grad_func(curr_params, custom_params, rest, config, data)
+    # Mark the model's loops for double buffering without GA too, as gradient_accumulation does per microbatch.
+    with model_loop_unroll_context(config):
+      (loss, (aux, non_param_rest)), (raw_grads, custom_grads) = grad_func(curr_params, custom_params, rest, config, data)
     nnx.update(state.model, nnx.State.merge(custom_grads, non_param_rest))
 
   raw_grads = jax.tree_util.tree_map(

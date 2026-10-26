@@ -27,6 +27,26 @@ from maxtext.common.common_types import ShardMode
 from maxtext.layers.moe import load_balance_updates_from_counts
 from maxtext.utils.sharding import maybe_shard_with_name
 
+# Gradient leaves at most this large serialize consecutive microbatches (see accumulate_gradient).
+_GA_BARRIER_MAX_LEAF_BYTES = 64 * 1024 * 1024
+
+
+def model_loop_unroll_context(config):
+  """Returns a context that marks the model's loops traced inside it for double buffering.
+
+  `_xla_loop_unroll_strategy` is only read by XLA:GPU (https://github.com/openxla/xla/pull/43468);
+  enable it with JAX_OPTIMIZATION_LEVEL=O1 and
+  XLA_FLAGS="--xla_gpu_enable_while_loop_unrolling=WHILE_LOOP_UNROLLING_MANUAL_UNROLL". The other
+  unrolling modes ignore it. Enter it around the model's forward and backward pass only, so that it
+  scopes the model's scans and not an enclosing loop such as the gradient accumulation scan.
+  On TPU/CPU it is a no-op: `set_xla_metadata` pre-populates frontend attributes on every traced op,
+  causing XLA's CallInliner to drop `_xla_compute_type` from `compute_on("device")` calls and
+  XLA:TPU to auto-offload those collectives to SparseCore.
+  """
+  if getattr(config, "hardware", "tpu") in ("gpu", "gpu_multiprocess"):
+    return set_xla_metadata(_xla_loop_unroll_strategy="double-buffer")
+  return contextlib.nullcontext()
+
 
 def gradient_accumulation_loss_and_grad(
     _loss_fn,
@@ -130,21 +150,20 @@ def gradient_accumulation_loss_and_grad(
     grad_func = jax.value_and_grad(_scaled_loss_fn, argnums=4, has_aux=True)
 
   def accumulate_gradient(acc_grad_and_loss, data):
+    # Make this microbatch's inputs depend on the previous microbatch's accumulated gradients, so XLA
+    # cannot start this forward pass (and allocate its activations) before the previous backward pass
+    # has finished, even when it unrolls or peels the accumulation loop.
+    # Only the small gradient leaves go through the barrier: they are produced by the same backward
+    # loops as the large ones, and keeping the large accumulators out of it lets XLA still fold the
+    # zero initial accumulator into the first microbatch's gradients.
+    grad_leaves, grad_treedef = jax.tree.flatten(acc_grad_and_loss["grad"])
+    small_idx = [i for i, x in enumerate(grad_leaves) if x.size * x.dtype.itemsize <= _GA_BARRIER_MAX_LEAF_BYTES]
+    data, small = jax.lax.optimization_barrier((data, [grad_leaves[i] for i in small_idx]))
+    for i, x in zip(small_idx, small):
+      grad_leaves[i] = x
+    acc_grad_and_loss["grad"] = jax.tree.unflatten(grad_treedef, grad_leaves)
     ga_params = acc_grad_and_loss["ga_params"]
-    # Scope double-buffering to model scans, not the enclosing gradient
-    # accumulation scan. `_xla_loop_unroll_strategy` is only read by XLA:GPU
-    # (https://github.com/openxla/xla/pull/43468); enable it with
-    # JAX_OPTIMIZATION_LEVEL=O1 and
-    # XLA_FLAGS="--xla_gpu_enable_while_loop_unrolling=WHILE_LOOP_UNROLLING_MANUAL_UNROLL".
-    # Skip on TPU/CPU: `set_xla_metadata` pre-populates frontend attributes on
-    # every traced op, causing XLA's CallInliner to drop `_xla_compute_type`
-    # from `compute_on("device")` calls and XLA:TPU to auto-offload those
-    # collectives to SparseCore.
-    loop_unroll_ctx = (
-        set_xla_metadata(_xla_loop_unroll_strategy="double-buffer")
-        if getattr(config, "hardware", "tpu") in ("gpu", "gpu_multiprocess")
-        else contextlib.nullcontext()
-    )
+    loop_unroll_ctx = model_loop_unroll_context(config)
     if is_nnx:
       # Reconstruct the model using the fixed parameters (ga_params)
       # and the advancing non-parameter state (RNGs) from the carry.

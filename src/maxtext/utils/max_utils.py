@@ -621,6 +621,31 @@ def unbox_logicallypartioned(boxed_pytree):
   )
 
 
+def tie_cotangents(*args):
+  """Returns args unchanged; in the backward pass, their cotangents are released together.
+
+  Pass an op's inputs through it and apply the op to the results, e.g. `y, w = tie_cotangents(y, w)`.
+  The optimization barrier makes each cotangent available only once all of them are computed, so XLA
+  cannot defer computing one of them (e.g. a weight gradient) and keep the large output cotangent it
+  consumes alive across the rest of the backward pass. Only cotangents flowing through the returned
+  values are tied, so use them only in that op.
+  """
+
+  @jax.custom_vjp
+  def tied(*a):
+    return a
+
+  def tied_fwd(*a):
+    return a, None
+
+  def tied_bwd(_, cts):
+    return jax.lax.optimization_barrier(cts)
+
+  tied.defvjp(tied_fwd, tied_bwd)
+  outputs = tied(*args)
+  return outputs[0] if len(args) == 1 else outputs
+
+
 # Cross entropy implementation is taken from original T5X codebase:
 # https://github.com/google-research/t5x/blob/ace831eea1e2742b4299cd1a9af7e4f302038351/t5x/losses.py#L25-L101
 @jax.custom_vjp
@@ -665,7 +690,6 @@ def _cross_entropy_with_logits_fwd(logits: jnp.ndarray, targets: jnp.ndarray, z_
         jnp.ndarray,
         jnp.ndarray,
         jnp.ndarray,
-        jnp.ndarray,
     ],
 ]:
   """Forward-mode of `cross_entropy_with_logits`."""
@@ -680,7 +704,6 @@ def _cross_entropy_with_logits_fwd(logits: jnp.ndarray, targets: jnp.ndarray, z_
   total_z_loss = z_loss * jax.lax.square(log_z)
   loss += total_z_loss
   return (loss, total_z_loss), (  # pyrefly: ignore[bad-return]
-      logits,
       targets,
       z_loss,
       exp_shifted,
@@ -696,19 +719,18 @@ def _cross_entropy_with_logits_bwd(
         jnp.ndarray,
         jnp.ndarray,
         jnp.ndarray,
-        jnp.ndarray,
     ],
     g: tuple[jnp.ndarray, jnp.ndarray],
 ) -> tuple[jnp.ndarray, None, None]:
   """Backward-mode of `cross_entropy_with_logits`."""
   g = g[0]  # Ignore z_loss component as that is only used for logging.  # pyrefly: ignore[bad-assignment]
-  logits, targets, z_loss, exp_shifted, sum_exp, log_z = res
+  targets, z_loss, exp_shifted, sum_exp, log_z = res
   # z-loss term adds the (2 * z_loss * log_z) factor.
   deriv = jnp.expand_dims(1 + 2 * z_loss * log_z, -1) * exp_shifted / sum_exp - targets
   g_logits = jnp.expand_dims(g, axis=-1) * deriv  # pyrefly: ignore[bad-argument-type]
 
   return (
-      jnp.asarray(g_logits, logits.dtype),
+      jnp.asarray(g_logits, exp_shifted.dtype),  # exp_shifted has the logits' dtype
       None,  # we don't need gradients on targets
       None,  # we don't need gradients on z_loss
   )  # sets z-loss coeff gradient to 0
