@@ -27,9 +27,6 @@ from maxtext.common.common_types import ShardMode
 from maxtext.layers.moe import load_balance_updates_from_counts
 from maxtext.utils.sharding import maybe_shard_with_name
 
-# Gradient leaves at most this large serialize consecutive microbatches (see accumulate_gradient).
-_GA_BARRIER_MAX_LEAF_BYTES = 64 * 1024 * 1024
-
 
 def model_loop_unroll_context(config):
   """Returns a context that marks the model's loops traced inside it for double buffering.
@@ -150,18 +147,6 @@ def gradient_accumulation_loss_and_grad(
     grad_func = jax.value_and_grad(_scaled_loss_fn, argnums=4, has_aux=True)
 
   def accumulate_gradient(acc_grad_and_loss, data):
-    # Make this microbatch's inputs depend on the previous microbatch's accumulated gradients, so XLA
-    # cannot start this forward pass (and allocate its activations) before the previous backward pass
-    # has finished, even when it unrolls or peels the accumulation loop.
-    # Only the small gradient leaves go through the barrier: they are produced by the same backward
-    # loops as the large ones, and keeping the large accumulators out of it lets XLA still fold the
-    # zero initial accumulator into the first microbatch's gradients.
-    grad_leaves, grad_treedef = jax.tree.flatten(acc_grad_and_loss["grad"])
-    small_idx = [i for i, x in enumerate(grad_leaves) if x.size * x.dtype.itemsize <= _GA_BARRIER_MAX_LEAF_BYTES]
-    data, small = jax.lax.optimization_barrier((data, [grad_leaves[i] for i in small_idx]))
-    for i, x in zip(small_idx, small):
-      grad_leaves[i] = x
-    acc_grad_and_loss["grad"] = jax.tree.unflatten(grad_treedef, grad_leaves)
     ga_params = acc_grad_and_loss["ga_params"]
     loop_unroll_ctx = model_loop_unroll_context(config)
     if is_nnx:
