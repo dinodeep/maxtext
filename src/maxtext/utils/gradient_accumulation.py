@@ -25,7 +25,6 @@ from flax import nnx
 
 from maxtext.common.common_types import ShardMode
 from maxtext.layers.moe import load_balance_updates_from_counts
-from maxtext.utils import ga_inplace
 from maxtext.utils.sharding import maybe_shard_with_name
 
 # Gradient leaves at most this large serialize consecutive microbatches (see accumulate_gradient).
@@ -150,34 +149,6 @@ def gradient_accumulation_loss_and_grad(
   else:
     grad_func = jax.value_and_grad(_scaled_loss_fn, argnums=4, has_aux=True)
 
-  # The gradients of scanned layer stacks are accumulated in place in the backward pass (see ga_inplace).
-  # Scan name -> path of the stack in the parameter (and gradient) state.
-  inplace_stack_paths = ga_inplace.stack_paths(params) if is_nnx else {}
-
-  def _subtree(tree, path):
-    for key in path:
-      tree = tree[key]
-    return tree
-
-  def _inplace_accumulators(grad):
-    """The running accumulators of the scanned layer stacks."""
-    return {name: _subtree(grad, path) for name, path in inplace_stack_paths.items()}
-
-  # Names of the layer scans that picked up their accumulator, recorded while tracing. A stack whose
-  # scan does not (e.g. one applied by another code path) keeps the regular accumulation below.
-  inplace_scans = []
-
-  def _loss_with_inplace_accumulators(model, accs, config, data, dropout_rng, params, is_train=True):
-    with ga_inplace.accumulate_into(accs) as finals:
-      loss, aux = _scaled_loss_fn(model, config, data, dropout_rng, params, is_train=is_train)
-    inplace_scans[:] = list(finals)
-    for name, acc_final in finals.items():
-      loss += ga_inplace.linear_seed_term(accs[name], acc_final)
-    return loss, aux
-
-  # Gradient w.r.t. the accumulators = accumulators + this microbatch's gradient of the scanned stacks.
-  inplace_grad_func = nnx.value_and_grad(_loss_with_inplace_accumulators, argnums=(0, 1), has_aux=True)
-
   def accumulate_gradient(acc_grad_and_loss, data):
     # Make this microbatch's inputs depend on the previous microbatch's accumulated gradients, so XLA
     # cannot start this forward pass (and allocate its activations) before the previous backward pass
@@ -193,19 +164,12 @@ def gradient_accumulation_loss_and_grad(
     acc_grad_and_loss["grad"] = jax.tree.unflatten(grad_treedef, grad_leaves)
     ga_params = acc_grad_and_loss["ga_params"]
     loop_unroll_ctx = model_loop_unroll_context(config)
-    inplace_accs, new_accs = {}, {}
     if is_nnx:
       # Reconstruct the model using the fixed parameters (ga_params)
       # and the advancing non-parameter state (RNGs) from the carry.
       local_model = nnx.merge(graphdef, ga_params, acc_grad_and_loss["rest_state"], copy=True)
-      inplace_accs = _inplace_accumulators(acc_grad_and_loss["grad"])
       with loop_unroll_ctx:
-        if inplace_accs:
-          (_, aux), (cur_batch_gradient, new_accs) = inplace_grad_func(
-              local_model, inplace_accs, config, data, None, None, is_train=True
-          )
-        else:
-          (_, aux), cur_batch_gradient = grad_func(local_model, config, data, None, None, is_train=True)
+        (_, aux), cur_batch_gradient = grad_func(local_model, config, data, None, None, is_train=True)
       _, _, next_rest_state = nnx.split(local_model, nnx.Param, ...)
       acc_grad_and_loss["rest_state"] = next_rest_state
     else:
@@ -221,12 +185,6 @@ def gradient_accumulation_loss_and_grad(
     acc_grad_and_loss["indexer_loss"] += aux["indexer_loss"]
     acc_grad_and_loss["mtp_loss"] += aux["mtp_loss"]
     acc_grad_and_loss["grad"] = jax.tree_util.tree_map(lambda x, y: x + y, cur_batch_gradient, acc_grad_and_loss["grad"])
-    if inplace_accs:
-      # These stacks were accumulated in place by the backward pass; their entries in
-      # cur_batch_gradient are zeros, and the sums above are dead.
-      for name in inplace_scans:
-        *parents, leaf = inplace_stack_paths[name]
-        _subtree(acc_grad_and_loss["grad"], parents)[leaf] = new_accs[name]
     acc_grad_and_loss["total_weights"] += aux["total_weights"]
     return acc_grad_and_loss, aux
 

@@ -73,7 +73,7 @@ from maxtext.models import (
 )
 
 from maxtext.multimodal import utils as mm_utils
-from maxtext.utils import ga_inplace, max_logging, max_utils, maxtext_utils, maxtext_utils_nnx, sharding
+from maxtext.utils import max_logging, max_utils, maxtext_utils, maxtext_utils_nnx, sharding
 from maxtext.utils.sharding import create_sharding
 
 # ------------------------------------------------------------------------------
@@ -1383,29 +1383,7 @@ class NNXDecoder(nnx.Module):
         scan_xs = (params, state, forced_routed_experts_scanned)
       else:
         scan_xs = (params, state)
-      ga_name = ga_inplace.stack_name(params)
-      ga_acc = ga_inplace.lookup(ga_name)
-      if ga_acc is not None and not ga_inplace.stacks(params, ga_acc, scan_axis):
-        ga_acc = None  # Not this stack's accumulator: accumulate as usual.
-      if ga_acc is None:
-        final_carry, scanned_state = jax.lax.scan(layer_fn_wrapped, x_in, scan_xs, unroll=unroll)
-      else:
-        # In-place gradient accumulation (see ga_inplace): carry the accumulator through the scan
-        # and route each layer's parameter cotangent into it. The accumulator keeps the stored
-        # layout, with the layer axis at scan_axis.
-
-        def ga_layer_fn(carry, xs):
-          x, acc = carry
-          acc = jax.lax.optimization_barrier(acc)  # keeps JAX from forwarding the invariant carry
-          (layer_params, *layer_rest), i = xs
-          layer_params = ga_inplace.inject_layer_params(layer_params, acc, i, scan_axis)
-          new_x, ys = layer_fn_wrapped(x, (layer_params, *layer_rest))
-          return (new_x, acc), ys
-
-        (final_carry, ga_acc_final), scanned_state = jax.lax.scan(
-            ga_layer_fn, (x_in, ga_acc), (scan_xs, jnp.arange(length)), unroll=unroll
-        )
-        ga_inplace.set_final(ga_name, ga_acc_final)
+      final_carry, scanned_state = jax.lax.scan(layer_fn_wrapped, x_in, scan_xs, unroll=unroll)
       returned_kv_stacked = None
 
       # Move the scan axis to each variable's param_scan_axis and restore its name
