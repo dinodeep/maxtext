@@ -60,6 +60,30 @@ class CSAPoolingConfig(enum.IntEnum):
   OVERLAP_WINDOWS = 1
 
 
+def compressed_block_metadata(position_ids: Array, ratio: int) -> Tuple[Array, Array, Array]:
+  """Complete per-document blocks, compacted into static ``S // ratio`` capacity.
+
+  Training callers supply contiguous documents with positions reset to zero.
+  Incomplete document tails produce no block; unused capacity is explicitly masked.
+  """
+  sequence = position_ids.shape[1]
+  token = jnp.arange(sequence)
+  end = jnp.minimum(token + ratio - 1, sequence - 1)
+  complete = ((position_ids % ratio) == 0) & (token + ratio <= sequence)
+  complete &= position_ids[:, end] == position_ids + ratio - 1
+  capacity = sequence // ratio
+  starts = jax.vmap(lambda row: jnp.nonzero(row, size=capacity, fill_value=0)[0])(complete)
+  valid = jnp.arange(capacity)[None] < jnp.sum(complete, axis=1, keepdims=True)
+  positions = jnp.take_along_axis(position_ids, starts, axis=1)
+  return starts, jnp.where(valid, positions, 0), valid
+
+
+def _packed_chunks(values: Array, starts: Array, valid: Array, ratio: int) -> Array:
+  indices = starts[:, :, None] + jnp.arange(ratio)
+  chunks = jax.vmap(lambda value, index: value[index])(values, indices)
+  return jnp.where(valid[:, :, None, None], chunks, 0)
+
+
 def csa_overlap_pooling(
     chunk_kv: Array,
     chunk_gate: Array,
@@ -266,6 +290,7 @@ def compute_csa_prefill_chunk_pooling(
     head_dim: int,
     dtype: Any,
     cache: Optional[Any] = None,
+    training: bool = False,
 ) -> Tuple[Array, int, Optional[Array], Optional[Array], int]:
   """Helper for CSA prefill chunking, overlap pooling, and RoPE embedding.
 
@@ -282,10 +307,22 @@ def compute_csa_prefill_chunk_pooling(
     head_dim: Target head dimension (`head_dim` or `index_head_dim`).
     dtype: Computation dtype.
     cache: Optional KVCache instance.
+    training: Compact complete per-document blocks using reset token positions.
 
   Returns:
     Tuple of (compressed, compressed_len, next_prior_kv, next_prior_gate, usable).
   """
+  if training and cache is None and seq_len >= compress_rate:
+    starts, positions, valid = compressed_block_metadata(position_ids, compress_rate)
+    chunks = _packed_chunks(kv, starts, valid, compress_rate)
+    gates = _packed_chunks(gate, starts, valid, compress_rate) + position_bias
+    # A previous physical row is usable only inside this document.
+    same_doc = valid & (positions >= compress_rate)
+    compressed, prior_kv, prior_gate = csa_overlap_pooling(chunks, gates, kv_norm, head_dim, is_same_doc=same_doc)
+    compressed = jnp.where(valid[:, :, None], compressed, 0)
+    compressed = rotary_emb(compressed, positions, unsqueeze_dim=None)
+    return compressed, compressed.shape[1], prior_kv, prior_gate, seq_len
+
   usable = (seq_len // compress_rate) * compress_rate
   chunk_kv = kv[:, :usable]
   chunk_gate = gate[:, :usable]
@@ -333,9 +370,11 @@ def compute_cudnn_csa_prefill_pooling(
   """cuDNN ratio-4 training counterpart of ``compute_csa_prefill_chunk_pooling``."""
   sequence = kv.shape[1]
   compressed = dsv4_cudnn.compress_ratio4(kv, gate, position_bias)
+  _, positions, valid = compressed_block_metadata(position_ids, 4)
+  compressed = jnp.where(valid[:, :, None], compressed, 0)
   if kv_norm is not None:
     compressed = kv_norm(compressed)
-  compressed = rotary_emb(compressed, position_ids[:, :sequence:4], unsqueeze_dim=None)
+  compressed = rotary_emb(compressed, positions, unsqueeze_dim=None)
   return compressed, compressed.shape[1], None, None, sequence
 
 
@@ -665,11 +704,22 @@ class DeepseekV4HCACompressor(BaseDeepseekCompressor):
         and cache is None
         and seq_len >= self.compress_rate
     ):
-      usable = (seq_len // self.compress_rate) * self.compress_rate
       compressed = dsv4_cudnn.compress_ratio128(kv, gate, self.position_bias.value)
-      compressed = self.kv_norm(compressed)
-      compressed = self.rotary_emb(compressed, position_ids[:, : usable : self.compress_rate], unsqueeze_dim=None)
+      _, positions, valid = compressed_block_metadata(position_ids, self.compress_rate)
+      compressed = self.kv_norm(jnp.where(valid[:, :, None], compressed, 0))
+      compressed = self.rotary_emb(compressed, positions, unsqueeze_dim=None)
       return jnp.expand_dims(compressed, axis=2), None
+
+    if model_mode == MODEL_MODE_TRAIN and cache is None and seq_len >= self.compress_rate:
+      starts, positions, valid = compressed_block_metadata(position_ids, self.compress_rate)
+      chunks = _packed_chunks(kv, starts, valid, self.compress_rate)
+      gates = _packed_chunks(gate, starts, valid, self.compress_rate) + self.position_bias.value
+      pooled = jnp.sum(chunks * jax.nn.softmax(gates, axis=2).astype(chunks.dtype), axis=2)
+      compressed = self.kv_norm(jnp.where(valid[:, :, None], pooled, 0))
+      compressed = self.rotary_emb(compressed, positions, unsqueeze_dim=None)
+      future = ((positions[:, None, :] + self.compress_rate) > (position_ids[:, :, None] + 1)) | ~valid[:, None, :]
+      mask = jnp.where(future[:, None], DEFAULT_MASK_VALUE, 0.0).astype(self.dtype)
+      return jnp.expand_dims(compressed, axis=2), mask
 
     # --- PREFILL CHUNKING & PRIMING ---
     usable = (seq_len // self.compress_rate) * self.compress_rate
@@ -943,6 +993,7 @@ class DeepseekV4Indexer(nnx.Module):
             head_dim=self.index_head_dim,
             dtype=self.dtype,
             cache=cache,
+            training=model_mode == MODEL_MODE_TRAIN,
         )
       compressed, compressed_len, next_prior_kv, next_prior_gate, usable = pooling_fn(**pooling_kwargs)
 
@@ -1017,9 +1068,14 @@ class DeepseekV4Indexer(nnx.Module):
 
     # --- ONLY RUN MATHEMATICAL CAUSAL MASK IN PREFILL/TRAIN ---
     if future_mask is None:
-      usable_len = compressed_len * self.compress_rate
-      block_positions = position_ids[:, : usable_len : self.compress_rate]
-      future_mask = (block_positions[:, None, :] + self.compress_rate) > (position_ids[:, :, None] + 1)
+      if model_mode == MODEL_MODE_TRAIN:
+        _, block_positions, valid = compressed_block_metadata(position_ids, self.compress_rate)
+      else:
+        block_positions = position_ids[:, : compressed_len * self.compress_rate : self.compress_rate]
+        valid = jnp.ones_like(block_positions, dtype=jnp.bool_)
+      future_mask = ((block_positions[:, None, :] + self.compress_rate) > (position_ids[:, :, None] + 1)) | ~valid[
+          :, None, :
+      ]
 
     # Apply the mask to the scores
     index_scores = jnp.where(future_mask, jnp.full_like(index_scores, -jnp.inf), index_scores)
@@ -1201,6 +1257,7 @@ class DeepseekV4CSACompressor(BaseDeepseekCompressor):
             head_dim=self.head_dim,
             dtype=self.dtype,
             cache=cache,
+            training=model_mode == MODEL_MODE_TRAIN,
         )
       compressed, compressed_len, next_prior_kv, next_prior_gate, usable = pooling_fn(**pooling_kwargs)
       compressed_kv = jnp.expand_dims(compressed, 2)
@@ -1709,6 +1766,9 @@ class CompressedAttention(Attention):
       is_valid_window = min_seg == max_seg
 
       compressed_segment_ids = jnp.where(is_valid_window, min_seg, -1)
+      if model_mode == MODEL_MODE_TRAIN:
+        starts, _, valid = compressed_block_metadata(inputs_positions, compress_rate)
+        compressed_segment_ids = jnp.where(valid, jnp.take_along_axis(decoder_segment_ids, starts, axis=1), -1)
       decoder_segment_ids_kv = jnp.concatenate([decoder_segment_ids, compressed_segment_ids], axis=1)
 
       valid_comp_seg = (decoder_segment_ids[:, :, None] == compressed_segment_ids[:, None, :]) & (
@@ -1745,6 +1805,7 @@ class CompressedAttention(Attention):
             inputs_positions,
             compressed_kv.shape[1],
             sparse_compressed_mask=sparse_compressed_mask if use_sparse_mask else None,
+            training=model_mode == MODEL_MODE_TRAIN,
         )
 
         if (
@@ -1779,6 +1840,7 @@ class CompressedAttention(Attention):
         compressed_mask = self.get_compressed_mask(
             inputs_positions,
             compressed_kv.shape[1],
+            training=model_mode == MODEL_MODE_TRAIN,
         )
 
     # Apply segment masking to the compressed blocks
@@ -1920,13 +1982,19 @@ class CompressedAttention(Attention):
       inputs_positions: Array,
       compressed_len: int,
       sparse_compressed_mask: Optional[Array] = None,
+      training: bool = False,
   ) -> Array:
     """Builds compressed attention mask. Returns sparse_compressed_mask if provided, else dense causal mask."""
     if sparse_compressed_mask is not None:
       return sparse_compressed_mask
-    usable_len = compressed_len * self.compress_ratio
-    block_positions = inputs_positions[:, : usable_len : self.compress_ratio]
-    is_future = (block_positions[:, None, :] + self.compress_ratio) > (inputs_positions[:, :, None] + 1)
+    if training:
+      _, block_positions, valid = compressed_block_metadata(inputs_positions, self.compress_ratio)
+    else:
+      block_positions = inputs_positions[:, : compressed_len * self.compress_ratio : self.compress_ratio]
+      valid = jnp.ones_like(block_positions, dtype=jnp.bool_)
+    is_future = ((block_positions[:, None, :] + self.compress_ratio) > (inputs_positions[:, :, None] + 1)) | ~valid[
+        :, None, :
+    ]
     dense_causal_mask = jnp.where(is_future, DEFAULT_MASK_VALUE, 0.0).astype(self.dtype)
     return dense_causal_mask[:, None, :, :]
 
@@ -2001,9 +2069,10 @@ class CompressedAttention(Attention):
     # Construct complete teacher mask: causal block mask + segment packing mask
     # 1. Causal block mask: query at position t can only attend to block w if (w+1)*r <= t+1
     if position_ids is not None:
-      usable_len = compressed_len * self.compress_ratio
-      block_positions = position_ids[:, : usable_len : self.compress_ratio]
-      future_mask = (block_positions[:, None, :] + self.compress_ratio) > (position_ids[:, :, None] + 1)
+      _, block_positions, valid = compressed_block_metadata(position_ids, self.compress_ratio)
+      future_mask = ((block_positions[:, None, :] + self.compress_ratio) > (position_ids[:, :, None] + 1)) | ~valid[
+          :, None, :
+      ]
     else:
       q_pos = jnp.arange(q_len)[:, None]
       block_end_pos = (jnp.arange(compressed_len)[None, :] + 1) * self.compress_ratio

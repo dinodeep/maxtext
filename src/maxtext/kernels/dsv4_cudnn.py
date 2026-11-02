@@ -63,8 +63,37 @@ def compress_ratio128(kv: Any, gate: Any, position_bias: Any) -> Any:
   )
 
 
-def indexer_ratio4(q: Any, compressed_k: Any, weights: Any, *, softmax_scale: float) -> Any:
-  """Dense ratio-4 indexer scores through Transformer Engine's VJP API."""
+def indexer_ratio4(
+    q: Any,
+    compressed_k: Any,
+    weights: Any,
+    *,
+    softmax_scale: float,
+    sequence_descriptor: Any = None,
+    max_seqlen_q: int | None = None,
+    max_seqlen_k: int | None = None,
+) -> Any:
+  """Ratio-4 scores for dense BHSD queries or caller-prepared THD queries.
+
+  THD requires a TE SequenceDescriptor for one contiguous pack and static
+  bounds. Columns index each query's own compressed segment, not global KV.
+  This low-level path does not enable packed training in CompressedAttention.
+  """
+  if q.ndim == 3:
+    from transformer_engine.jax.deepseek_v4 import dsa_indexer  # pylint: disable=import-outside-toplevel
+
+    return dsa_indexer(
+        q.astype(jnp.bfloat16),
+        compressed_k[:, None, :].astype(jnp.bfloat16),
+        weights.astype(jnp.bfloat16),
+        ratio=4,
+        sm_scale=softmax_scale,
+        sequence_descriptor=sequence_descriptor,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+    )
+  if q.ndim != 4 or any(x is not None for x in (sequence_descriptor, max_seqlen_q, max_seqlen_k)):
+    raise ValueError("dense indexer expects BHSD queries without packed metadata")
   from transformer_engine.jax.deepseek_v4 import dsa_indexer_batched  # pylint: disable=import-outside-toplevel
 
   q_bshd = jnp.transpose(q, (0, 2, 1, 3))
