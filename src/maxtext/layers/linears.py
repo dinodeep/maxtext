@@ -161,17 +161,20 @@ def _compute_dot_general_nnx(
     scale_block_size: int | tuple[int, ...] | None = None,
     act_calibration_method: str = "absmax",
     weight_grad_in_kernel_order: bool = False,
+    kernel_amax: Array | None = None,
 ):
   """Computes a dot_general operation that may be quantized."""
   dot_general = lax.dot_general
   matmul_precision = lax.Precision(matmul_precision)
   if quant_dot_general is not None:
     dimension_numbers = ((axis, contract_ind), ((), ()))
+    # Precomputed kernel amax for TE current scaling (te_precompute_weight_amax); only TE's wrapper accepts it.
+    extra = {} if kernel_amax is None else {"kernel_amax": kernel_amax}
     if not isinstance(quant_dot_general, nnx_wrappers.ToNNX):
-      return quant_dot_general(inputs, kernel, dimension_numbers, precision=None)
+      return quant_dot_general(inputs, kernel, dimension_numbers, precision=None, **extra)
     if initializing:
-      quant_dot_general.lazy_init(inputs, kernel, dimension_numbers, precision=None)
-    return quant_dot_general(inputs, kernel, dimension_numbers, precision=None, mutable=["aqt"])
+      quant_dot_general.lazy_init(inputs, kernel, dimension_numbers, precision=None, **extra)
+    return quant_dot_general(inputs, kernel, dimension_numbers, precision=None, mutable=["aqt"], **extra)
 
   if compute_dtype is None:
     compute_dtype = inputs.dtype
@@ -335,6 +338,19 @@ class DenseGeneral(nnx.Module):
           kernel_val,
           sharding=self.kernel_axes,
       )
+
+    # te_precompute_weight_amax: one float32 amax per kernel (per layer once scanned), refreshed each step by
+    # quantizations.refresh_te_kernel_amaxes; seeded with the initial kernel's amax so it is never zero.
+    precompute_amax = (
+        isinstance(self.quant, quantizations.TransformerEngineQuantization)
+        and self.quant.precompute_weight_amax
+        and not quantizations.in_serve_mode(self.quant)
+    )
+    self.kernel_amax = (
+        quantizations.TEKernelAmax(quantizations.kernel_amax_like(kernel_val, self.dtype).reshape(1), out_sharding=(None,))
+        if precompute_amax
+        else None
+    )
 
     if self.use_bias:
       bias_axes = self.kernel_axes[-len(self.out_features_shape) :]
@@ -556,6 +572,9 @@ class DenseGeneral(nnx.Module):
         and kernel_scale is None
         and not is_fp8_dtype(getattr(kernel, "dtype", None))
     )
+    kernel_amax = None
+    if quant_dot_general is not None and getattr(self, "kernel_amax", None) is not None:
+      kernel_amax = self.kernel_amax[...]
     output = _compute_dot_general_nnx(
         inputs,
         kernel,
@@ -571,6 +590,7 @@ class DenseGeneral(nnx.Module):
         scale_block_size=self.block_size,
         act_calibration_method=self.quant.act_calibration_method if native_fp8_compute else "absmax",
         weight_grad_in_kernel_order=weight_grad_in_kernel_order,
+        kernel_amax=kernel_amax,
     )
 
     if self.bias is not None:

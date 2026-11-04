@@ -1404,6 +1404,15 @@ class MoEGeneral(BaseModel):
       False,
       description="Quantize TE MoE weight shards before the FSDP all-gather; false quantizes after gathering.",
   )
+  te_precompute_weight_amax: bool = Field(
+      False,
+      description=(
+          "With quantization=te_fp8_currentscaling, compute each TE dense kernel's amax (max |W|) once per training "
+          "step, before gradient accumulation, and pass it to TE instead of computing it and all-reducing it across "
+          "FSDP in every GEMM call. Removes the per-call amax all-reduces from the layer loops, and reduces the amax "
+          "over every axis the kernel is sharded on, so all shards of a weight share one scale."
+      ),
+  )
   te_ep_overflow_check_every_n_steps: PositiveInt = Field(
       20,
       description=(
@@ -6748,6 +6757,8 @@ class MaxTextConfig(
 
     if self.eval_interval > 0 >= self.eval_steps and self.generate_padding_batch_eval:
       raise ValueError("`eval_steps` must be > 0 when `generate_padding_batch_eval` is True.")
+    if self.te_precompute_weight_amax and self.quantization != "te_fp8_currentscaling":
+      raise ValueError("te_precompute_weight_amax=True requires quantization=te_fp8_currentscaling.")
     if self.use_batch_split_schedule:
       if self.quantization and not self.quantization == "fp8_full":
         raise ValueError("Batch split quantization only supports `quantization=fp8_full`")

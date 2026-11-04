@@ -1756,6 +1756,58 @@ def manual_quantize(tensor: jax.Array, dtype: jax.typing.DTypeLike, calibration_
   return qpl.QArray(qvalue=q_tensor, scale=scale_tensor_qpl)
 
 
+class TEKernelAmax(nnx.Variable):
+  """Amax (max |W|) of a TE current-scaling dense kernel as float32[1], refreshed once per training step.
+
+  Not a parameter: it is derived from the kernel by `refresh_te_kernel_amaxes` and carried as layer state, so a
+  scanned stack holds float32[layers, 1]. The trailing size-1 axis (TE's amax shape) gives the variable a logical
+  axis of its own, so the scan-axis metadata round trip in the layer scans never leaves it with empty sharding
+  names. See `te_precompute_weight_amax`.
+  """
+
+
+def kernel_amax_like(kernel, compute_dtype, layer_axis=None):
+  """Amax of `kernel` as TE sees it (cast to the compute dtype), per layer when `layer_axis` is set."""
+  values = jnp.abs(jnp.asarray(kernel, compute_dtype).astype(jnp.float32))
+  if layer_axis is None:
+    return jnp.max(values)
+  return jnp.max(values, axis=tuple(a for a in range(values.ndim) if a != layer_axis))
+
+
+def refresh_te_kernel_amaxes(model: nnx.Module) -> int:
+  """Recomputes every TEKernelAmax from its module's kernel; returns how many were refreshed.
+
+  Call once per step before the forward pass (the weights are fixed for the whole step). Under jit, each amax
+  is a local max plus one all-reduce over every axis the kernel is sharded on, so all shards of a weight share
+  one scale. A stacked (scanned) amax has one entry per layer; its kernel's layer axis is the `param_scan_axis`
+  recorded in the kernel's metadata.
+  """
+  count = 0
+  for _, node in nnx.iter_graph(model):
+    amax_var = getattr(node, "kernel_amax", None)
+    if not isinstance(amax_var, TEKernelAmax):
+      continue
+    kernel_var = node.kernel
+    kernel = kernel_var.get_value()
+    amax = amax_var.get_value()
+    if amax.shape == (1,):
+      new = kernel_amax_like(kernel, node.dtype).reshape(1)
+    elif amax.ndim == 2 and amax.shape[1] == 1:
+      layer_axis = kernel_var.get_metadata().get("param_scan_axis", 0)
+      if kernel.ndim <= layer_axis or kernel.shape[layer_axis] != amax.shape[0]:
+        raise ValueError(
+            f"TEKernelAmax of shape {amax.shape} does not match kernel {kernel.shape} on layer axis {layer_axis}."
+        )
+      new = kernel_amax_like(kernel, node.dtype, layer_axis).reshape(amax.shape)
+    else:
+      raise NotImplementedError(
+          f"te_precompute_weight_amax supports at most one level of layer stacking (amax shape {amax.shape})."
+      )
+    amax_var.set_value(jax.lax.stop_gradient(new.astype(jnp.float32)))
+    count += 1
+  return count
+
+
 class TransformerEngineQuantization(Quantization):
   """Class for TransformerEngine quantization recipes."""
 
@@ -1771,13 +1823,20 @@ class TransformerEngineQuantization(Quantization):
 
     self._te_comm_gemm_overlap_policy = config.te_comm_gemm_overlap
 
+    # Dense layers keep a TEKernelAmax refreshed once per step (refresh_te_kernel_amaxes) and pass it to TE.
+    self.precompute_weight_amax = bool(getattr(config, "te_precompute_weight_amax", False))
+
   def __hash__(self):
-    return hash((self.quant_mode, self._recipe))
+    return hash((self.quant_mode, self._recipe, self.precompute_weight_amax))
 
   def __eq__(self, other):
     if not isinstance(other, TransformerEngineQuantization):
       return False
-    return (self.quant_mode, self._recipe) == (other.quant_mode, other._recipe)
+    return (self.quant_mode, self._recipe, self.precompute_weight_amax) == (
+        other.quant_mode,
+        other._recipe,
+        other.precompute_weight_amax,
+    )
 
   @staticmethod
   def _get_recipe(recipe_name: str):
@@ -1923,12 +1982,16 @@ class TransformerEngineQuantization(Quantization):
           if self._te_comm_gemm_overlap_policy != TeCommGemmOverlapPolicy.DISABLED
           else tex.noop_collective_op_set
       )
+      # Precomputed amax of the whole kernel (TEKernelAmax), or None for TE's per-call amax.
+      kernel_amax = kwargs.get("kernel_amax")
+      extra = {} if kernel_amax is None else {"kernel_amax": kernel_amax}
       return transformer_engine.jax.dense.dense(
           x,
           kernel,
           contracting_dims=contracting_dims,
           quantizer_set=quantizer_set,
           collective_op_set=collective_op_set,
+          **extra,
       )
 
     return self._wrap(te_dot_general, "dot_general")

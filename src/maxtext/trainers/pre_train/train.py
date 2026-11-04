@@ -66,6 +66,7 @@ from maxtext.utils import elastic_utils
 from maxtext.layers.multi_token_prediction import calculate_mtp_acceptance_rate, calculate_mtp_loss, mtp_acceptance, mtp_losses
 from maxtext.layers.attention_mla import indexer_losses
 from maxtext.layers import moe
+from maxtext.layers import quantizations
 from maxtext.common import checkpointing, profiler
 from maxtext.common import snapshotting
 from maxtext.common.goodput import (
@@ -563,6 +564,9 @@ def train_step(model, config, state_mesh_shardings, params_shardings, state, dat
   # --- Per-path initialization ---
   input_state_leaves = jax.tree_util.tree_leaves(state) if config.moe_dropless_fallback == "step" else None
   state = nnx.merge(model, state)  # reconstruct TrainStateNNX
+  if config.te_precompute_weight_amax:
+    # The weights are fixed for the whole step: compute TE kernel amaxes once, before any microbatch.
+    quantizations.refresh_te_kernel_amaxes(state.model)
   loss_model, loss_params, loss_rng = state.model, None, None
 
   # --- Gradient computation ---
@@ -833,6 +837,8 @@ def eval_step(model, config, state, data, dropout_rng=None):
   """eval_step no backprop and new state compared with train_step."""
   del dropout_rng  # unused for NNX (kept for jit signature parity)
   state = nnx.merge(model, state)  # reconstruct TrainStateNNX
+  if config.te_precompute_weight_amax:
+    quantizations.refresh_te_kernel_amaxes(state.model)
   loss, aux = loss_fn(state.model, config, data, None, None, is_train=False)
 
   mtp_acceptance_rate = 0.0
