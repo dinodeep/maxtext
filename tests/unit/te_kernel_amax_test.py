@@ -49,6 +49,15 @@ class TEKernelAmaxTest(unittest.TestCase):
     quantizations.refresh_te_kernel_amaxes(m)
     self.assertEqual(float(m.layers[0].kernel_amax.get_value()[0]), 1.0)
 
+  def test_amax_is_rounded_to_compute_dtype_under_jit(self):
+    # 0.2009 rounds up to 0.201171875 in bf16. Under jit, XLA may drop a float32 -> bf16 -> float32 cast round trip,
+    # which would leave the amax below the largest bf16 value that TE quantizes.
+    # The kernel must be large enough that XLA does not constant-fold or special-case it.
+    k = jnp.zeros((128, 256), jnp.float32).at[3, 5].set(0.2009).at[7, 9].set(-0.1)
+    amax = jax.jit(quantizations.kernel_amax_like, static_argnums=1)(k, jnp.bfloat16)
+    self.assertEqual(float(amax), float(jnp.max(jnp.abs(k.astype(jnp.bfloat16))).astype(jnp.float32)))
+    self.assertEqual(float(amax), 0.201171875)
+
   def test_mismatched_stack_raises(self):
     k = jnp.ones((4, 3, 2), jnp.float32)
     m = _Model(_Dense(k, jnp.zeros((5, 1), jnp.float32), scan_axis=1))

@@ -1767,11 +1767,19 @@ class TEKernelAmax(nnx.Variable):
 
 
 def kernel_amax_like(kernel, compute_dtype, layer_axis=None):
-  """Amax of `kernel` as TE sees it (cast to the compute dtype), per layer when `layer_axis` is set."""
-  values = jnp.abs(jnp.asarray(kernel, compute_dtype).astype(jnp.float32))
+  """Amax of `kernel` as TE sees it (cast to the compute dtype), per layer when `layer_axis` is set.
+
+  Rounding is monotonic, so this is the float32 amax rounded to the compute dtype. The rounding uses
+  `lax.reduce_precision` rather than a cast round trip, which XLA may remove (xla_allow_excess_precision) and so
+  leave an amax slightly below the largest compute-dtype value that TE quantizes.
+  """
+  values = jnp.abs(jnp.asarray(kernel).astype(jnp.float32))
   if layer_axis is None:
-    return jnp.max(values)
-  return jnp.max(values, axis=tuple(a for a in range(values.ndim) if a != layer_axis))
+    amax = jnp.max(values)
+  else:
+    amax = jnp.max(values, axis=tuple(a for a in range(values.ndim) if a != layer_axis))
+  finfo = jnp.finfo(compute_dtype)
+  return jax.lax.reduce_precision(amax, exponent_bits=finfo.nexp, mantissa_bits=finfo.nmant)
 
 
 def refresh_te_kernel_amaxes(model: nnx.Module) -> int:
