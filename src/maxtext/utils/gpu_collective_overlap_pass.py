@@ -36,6 +36,33 @@ Steps:
      Each iteration ends with schedule.update()/verify().
   3. Finally, hoist host-offload copy starts to their earliest legal position.
 
+Every relocation in step 2 is checked against the async windows of its
+computation (_WindowGuard): by default a move that grows the summed exposed
+time (latency minus overlap, where positive) of those windows is rejected.
+
+Environment toggles of the EP-window protection (default in brackets):
+  COLLECTIVE_OVERLAP_RESOLVE_WRAPPED_CUSTOM_CALL [1]: key an async call whose
+      wrapped root is not the profiled op (te_ep_prepare's tuple root) by the
+      custom-call it runs, so its window has a latency.
+  COLLECTIVE_OVERLAP_WINDOW_GUARD [1]: the window guard above.
+  COLLECTIVE_OVERLAP_WINDOW_GUARD_MODE [total]: "total" judges the summed
+      deficit of all windows (a blocker relocation that already passed the
+      net-exposure gate is exempt); "window" rejects any move that shrinks a
+      single window below its latency, whatever the others gain.
+  COLLECTIVE_OVERLAP_WINDOW_GUARD_MARGIN_US [0]: slack kept above a latency.
+  COLLECTIVE_OVERLAP_FILL_CONSUMER_FIRST [0]: fill a window whose done feeds
+      another window's start (te_ep_prepare -> te_ep_dispatch) after that one.
+  COLLECTIVE_OVERLAP_PIN_WINDOW_FILLS [0]: keep every fill relocation inside
+      its window for the rest of the pass (all reorder iterations).
+  COLLECTIVE_OVERLAP_KEEP_BEST_ITERATION [0]: return the reorder iteration
+      (or the input) with the lowest total exposed time, not the last one.
+Boolean toggles take 1/true/yes/on or 0/false/no/off (any case); anything
+else keeps the default.
+
+With all of these off the pass is still not the one before them: the
+exposed-collective chase no longer moves a start above an operand (see
+_chase_exposed_collective_blocker_earlier), a bug fix with no toggle.
+
 Call ``register()`` once before the first ``jax.jit``-compiled function runs.
 """
 
@@ -67,8 +94,43 @@ if not _logger.handlers:
   _logger.addHandler(_h)
   _logger.propagate = False
 
-# Populated once PGLE delivers its FDO profile bytes.
+# Costs (us) of the module being scheduled, by instruction name. Rebuilt for
+# each module by _select_module_costs from _pgle_costs_by_fingerprint.
 _profile_costs: dict[str, float] = {}
+
+# PGLE profile costs pooled across chunks, by module fingerprint, then by
+# instruction name. XLA names each cost "<fingerprint>::<instruction>"
+# (FingerprintedCostName in xla/service/hlo_profiling_utils), where the
+# fingerprint is the module's "fingerprint_before_lhs" frontend attribute, so
+# that modules sharing instruction names (fusion.1, ...) keep separate costs.
+# Costs without a fingerprint (hand-written profiles, older XLA) apply to every
+# module and are kept under _UNFINGERPRINTED.
+_pgle_costs_by_fingerprint: dict[str, dict[str, float]] = {}
+_UNFINGERPRINTED = ""
+_COST_NAME_SEP = "::"
+_FINGERPRINT_ATTRIBUTE = "fingerprint_before_lhs"
+# HloModuleProto.frontend_attributes (xla/service/hlo.proto); FrontendAttributes
+# is {map<string, string> map = 1}.
+_HLO_MODULE_FRONTEND_ATTRIBUTES_FIELD = 19
+
+_ENV_TRUE = ("1", "true", "yes", "on")
+_ENV_FALSE = ("0", "false", "no", "off")
+
+
+def _env_flag(name: str, default: bool) -> bool:
+  """Boolean environment toggle: 1/true/yes/on -> True, 0/false/no/off ->
+  False (case-insensitive, surrounding whitespace ignored); unset or anything
+  else -> `default`."""
+  value = os.environ.get(name)
+  if value is None:
+    return default
+  value = value.strip().lower()
+  if value in _ENV_TRUE:
+    return True
+  if value in _ENV_FALSE:
+    return False
+  return default
+
 
 # ---------------------------------------------------------------------------
 # Proto compilation (PGLE profile + XSpace), all in one directory to avoid
@@ -196,6 +258,22 @@ def _load_costs_from_fdo(fdo_bytes: bytes) -> dict[str, float]:
   return {c.name: c.cost_us for c in profiled.costs}
 
 
+def _split_cost_name(cost_name: str) -> tuple[str, str]:
+  """(fingerprint, instruction name) of a PGLE cost name; the fingerprint is
+  _UNFINGERPRINTED for a name without one (SplitFingerprintedCostName)."""
+  fingerprint, sep, op_name = cost_name.partition(_COST_NAME_SEP)
+  if not sep:
+    return _UNFINGERPRINTED, cost_name
+  return fingerprint, op_name
+
+
+def _pool_costs(costs: dict[str, float]) -> None:
+  """Add PGLE costs to _pgle_costs_by_fingerprint, split by fingerprint."""
+  for cost_name, cost_us in costs.items():
+    fingerprint, op_name = _split_cost_name(cost_name)
+    _pgle_costs_by_fingerprint.setdefault(fingerprint, {})[op_name] = cost_us
+
+
 def _update_profile(fdo_bytes: bytes) -> None:
   """Merge an FDO profile chunk into the pooled per-instruction costs."""
   if not fdo_bytes:
@@ -204,18 +282,99 @@ def _update_profile(fdo_bytes: bytes) -> None:
     costs = _load_costs_from_fdo(fdo_bytes)
     if not costs:
       return
-    _profile_costs.update(costs)
-    # PGLE's own te_ep entries are underestimates; keep the live corrections.
-    _profile_costs.update(_te_ep_overrides)
+    _pool_costs(costs)
     n_coll = sum(1 for k in costs if "all-gather" in k or "reduce-scatter" in k)
     _logger.info(
-        "gpu_collective_overlap_pass: merged PGLE profile chunk: %d entries (%d collectives); pool now %d.",
+        "gpu_collective_overlap_pass: merged PGLE profile chunk: %d entries (%d collectives); "
+        "pool now %d entries over %d module fingerprint(s).",
         len(costs),
         n_coll,
-        len(_profile_costs),
+        sum(len(c) for c in _pgle_costs_by_fingerprint.values()),
+        len(_pgle_costs_by_fingerprint),
     )
   except Exception as exc:  # pylint: disable=broad-except
     _logger.warning("gpu_collective_overlap_pass: failed to parse FDO profile: %s", exc)
+
+
+def _read_varint(buf, i: int) -> tuple[int, int]:
+  value, shift = 0, 0
+  while True:
+    b = buf[i]
+    i += 1
+    value |= (b & 0x7F) << shift
+    if b < 0x80:
+      return value, i
+    shift += 7
+
+
+def _proto_fields(buf):
+  """Yield (field number, wire type, value) for the top-level fields of a
+  serialized protobuf message. Length-delimited values are memoryview slices,
+  so skipping large fields (the computations) copies nothing."""
+  buf = memoryview(buf)
+  i, n = 0, len(buf)
+  while i < n:
+    key, i = _read_varint(buf, i)
+    field, wire_type = key >> 3, key & 7
+    if wire_type == 0:
+      value, i = _read_varint(buf, i)
+    elif wire_type == 1:
+      value, i = buf[i : i + 8], i + 8
+    elif wire_type == 2:
+      length, i = _read_varint(buf, i)
+      value, i = buf[i : i + length], i + length
+    elif wire_type == 5:
+      value, i = buf[i : i + 4], i + 4
+    else:
+      raise ValueError(f"unsupported protobuf wire type {wire_type} for field {field}")
+    if i > n:
+      raise ValueError("truncated protobuf message")
+    yield field, wire_type, value
+
+
+def _module_fingerprint(serialized_hlo: bytes) -> Optional[str]:
+  """The "fingerprint_before_lhs" frontend attribute of a serialized
+  HloModuleProto (the fingerprint PGLE keys its costs by), or None.
+
+  The python HloModule binding exposes no frontend attributes, so this reads
+  the proto directly instead of compiling xla/service/hlo.proto.
+  """
+  try:
+    for field, wire_type, attributes in _proto_fields(serialized_hlo):
+      if field != _HLO_MODULE_FRONTEND_ATTRIBUTES_FIELD or wire_type != 2:
+        continue
+      for entry_field, entry_wire_type, entry in _proto_fields(attributes):
+        if entry_field != 1 or entry_wire_type != 2:
+          continue
+        key_value = {f: bytes(v).decode("utf-8") for f, wt, v in _proto_fields(entry) if wt == 2}
+        if key_value.get(1) == _FINGERPRINT_ATTRIBUTE:
+          return key_value.get(2)
+  except (ValueError, IndexError, UnicodeDecodeError) as exc:
+    _logger.warning("gpu_collective_overlap_pass: could not read the module fingerprint: %s", exc)
+  return None
+
+
+def _select_module_costs(fingerprint: Optional[str], module_name: str) -> None:
+  """Rebuild _profile_costs for the module with `fingerprint`: the
+  unfingerprinted costs, then that module's own, then the live te_ep
+  corrections (PGLE's te_ep entries are underestimates)."""
+  _profile_costs.clear()
+  _wrapped_custom_call_cache.clear()
+  _inst_cost_cache.clear()
+  _profile_costs.update(_pgle_costs_by_fingerprint.get(_UNFINGERPRINTED, {}))
+  own = _pgle_costs_by_fingerprint.get(fingerprint, {}) if fingerprint else {}
+  _profile_costs.update(own)
+  _profile_costs.update(_te_ep_overrides)
+  _logger.info(
+      "gpu_collective_overlap_pass [%s]: fingerprint %s: %d PGLE costs of this module, %d unfingerprinted, "
+      "%d live te_ep corrections (%d other module fingerprint(s) in the pool).",
+      module_name,
+      fingerprint or "<none>",
+      len(own),
+      len(_pgle_costs_by_fingerprint.get(_UNFINGERPRINTED, {})),
+      len(_te_ep_overrides),
+      sum(1 for fp in _pgle_costs_by_fingerprint if fp not in (_UNFINGERPRINTED, fingerprint)),
+  )
 
 
 # TODO tixxx remove the above invocation cost once PGLE can return the
@@ -419,9 +578,17 @@ _SM_GATE = os.environ.get("COLLECTIVE_OVERLAP_SM_GATE", "1") != "0"
 _SM_GATE_MIN_US = float(os.environ.get("COLLECTIVE_OVERLAP_SM_GATE_MIN_US", "1000"))
 
 
+# _opcode_str results by opcode enum name ("kGetTupleElement"): a fixed mapping.
+_opcode_str_cache: dict[str, str] = {}
+
+
 def _opcode_str(inst) -> str:
   """Hyphenated opcode string (e.g. "get-tuple-element") for an HloInstruction."""
-  return re.sub(r"(?<!^)(?=[A-Z])", "-", inst.opcode.name[1:]).lower()
+  name = inst.opcode.name
+  s = _opcode_str_cache.get(name)
+  if s is None:
+    s = _opcode_str_cache[name] = re.sub(r"(?<!^)(?=[A-Z])", "-", name[1:]).lower()
+  return s
 
 
 # Host-offload copies: XLA lowers a remat offload to a pair of async DMAs,
@@ -485,6 +652,7 @@ def _register_host_offload_copies(module) -> None:
         names.update(user.name for user in inst.users())
   _host_offload_copy_names.clear()
   _host_offload_copy_names.update(names)
+  _inst_cost_cache.clear()
   if names:
     _logger.info(
         "gpu_collective_overlap_pass [%s]: registered %d host-offload copy instruction(s) (starts and dones): %s",
@@ -712,9 +880,76 @@ def _resolve_profile_key(async_start, comp_by_name: dict) -> str:
       comp = comp_by_name.get(m.group(1))
       if comp is not None:
         root = _computation_root(comp)
-  if root is None:
-    return async_start.name
-  return _unwrap_to_leaf_name(root, comp_by_name)
+  key = async_start.name if root is None else _unwrap_to_leaf_name(root, comp_by_name)
+  if not _RESOLVE_WRAPPED_CUSTOM_CALL or key in _profile_costs:
+    return key
+  # The wrapped computation's root is not the profiled op: a te_ep_prepare
+  # call-start's root is a tuple of get-tuple-elements of the custom-call.
+  # The walk is cached: this runs millions of times per module.
+  wrapped = _wrapped_custom_call_cache.get(async_start.name, _NOT_CACHED)
+  if wrapped is _NOT_CACHED:
+    wrapped = _wrapped_custom_call_name(async_start, comp_by_name)
+    _wrapped_custom_call_cache[async_start.name] = wrapped
+  return wrapped or key
+
+
+# COLLECTIVE_OVERLAP_RESOLVE_WRAPPED_CUSTOM_CALL=0 restores the old key of an
+# async call whose wrapped root is not the custom-call itself (e.g. a tuple):
+# the root's name, which has no profile entry, so the window was unprotected.
+_RESOLVE_WRAPPED_CUSTOM_CALL = _env_flag("COLLECTIVE_OVERLAP_RESOLVE_WRAPPED_CUSTOM_CALL", True)
+
+_CALLED_COMP_RE = re.compile(r"(?:calls|to_apply)=%([\w.\-]+)")
+
+# _wrapped_custom_call_name results by async start name, for the module whose
+# costs _select_module_costs selected last (it clears this): the result
+# depends only on the module's structure and its costs.
+_wrapped_custom_call_cache: dict[str, Optional[str]] = {}
+_NOT_CACHED = object()
+
+
+def _wrapped_custom_call_name(async_start, comp_by_name: dict) -> Optional[str]:
+  """Name of the custom-call an async call-start/async-start runs, found by
+  walking its called computation (and nested call/async wrappers in it).
+
+  This is the name PGLE (after the "<fingerprint>::" prefix is stripped, see
+  _select_module_costs) and the live XSpace corrections key the op's cost by:
+  the kernels are tagged with the custom-call's name, not with the wrapper's
+  root. Among the custom-calls at the shallowest level that has any, the one
+  with the largest profiled cost wins, else the first in instruction order.
+  Returns None if there is none.
+  """
+  try:
+    text = async_start.to_string()
+  except Exception:
+    return None
+  frontier = list(_CALLED_COMP_RE.findall(text))
+  seen: set = set()
+  for _ in range(_MAX_PROFILE_KEY_UNWRAP_HOPS):
+    custom_calls: list = []
+    nested: list = []
+    for comp_name in frontier:
+      comp = comp_by_name.get(comp_name)
+      if comp is None or comp_name in seen:
+        continue
+      seen.add(comp_name)
+      try:
+        for inst in comp.instructions():
+          opc = _opcode_str(inst)
+          if opc == "custom-call":
+            custom_calls.append(inst.name)
+          elif opc in ("call", "call-start", "async-start"):
+            nested.extend(_CALLED_COMP_RE.findall(inst.to_string()))
+      except Exception:
+        continue
+    if custom_calls:
+      costed = [n for n in custom_calls if _profile_costs.get(n)]
+      if costed:
+        return max(costed, key=lambda n: _profile_costs[n])
+      return custom_calls[0]
+    if not nested:
+      return None
+    frontier = nested
+  return None
 
 
 def _is_te_ep_call_start(inst, comp_by_name: dict) -> bool:
@@ -777,7 +1012,24 @@ _MAX_RELOCATE_CHAIN = 64
 _HEAVY_COMPUTE_MIN_US = 5.0
 
 
+# _resolve_inst_cost results by instruction name (unique within a module).
+# A cost depends only on _profile_costs, _host_offload_copy_names and the
+# module's structure, so this is cleared wherever the first two are rebuilt
+# (_select_module_costs, _register_host_offload_copies) and at the start of
+# every _reorder_to_fixed_point call. Code that edits either directly (tests)
+# must clear it too.
+_inst_cost_cache: dict[str, float] = {}
+
+
 def _resolve_inst_cost(inst, comp_by_name: dict) -> float:
+  """Profiled cost (us) of inst (cached, see _inst_cost_cache)."""
+  c = _inst_cost_cache.get(inst.name)
+  if c is None:
+    c = _inst_cost_cache[inst.name] = _resolve_inst_cost_uncached(inst, comp_by_name)
+  return c
+
+
+def _resolve_inst_cost_uncached(inst, comp_by_name: dict) -> float:
   """Profiled cost (us) of inst.
 
   A kind=kCustom fusion (e.g. dynamic-slice-fusion around te_gemm_v2_ffi plus
@@ -926,6 +1178,7 @@ def _relocate_async_done_before_te_ep(
     comp_by_name: dict,
     collective_latency: float,
     module_name: str = "",
+    guard: Optional[_WindowGuard] = None,
 ):
   """For an already-hidden async collective, pull `done` forward to just before
   the first te_ep call-start at or after the point where its latency is
@@ -935,7 +1188,9 @@ def _relocate_async_done_before_te_ep(
   benefit; an earlier one frees them to fill te_ep windows (the largest,
   hardest-to-fill ones). Always legal: done's only operand is start, and its
   consumers already sit after its old position. Control-predecessors are
-  respected.
+  respected. The move must pass `guard` (it only shortens this collective's
+  own window, which stays at or above its latency, so the guard rejects it
+  only with a positive _WINDOW_GUARD_MARGIN_US).
 
   Returns (changed, seq, positions, name_to_pos).
   """
@@ -972,7 +1227,10 @@ def _relocate_async_done_before_te_ep(
   if target is None:
     return False, seq, positions, name_to_pos
 
-  new_seq, new_positions, new_name_to_pos = _commit_sequence(schedule, comp, _reinsert(seq, [], target, async_done))
+  new_seq = _reinsert(seq, [], target, async_done)
+  if not _guard_allows(guard, seq, new_seq, f"done relocation of {async_done.name}", module_name):
+    return False, seq, positions, name_to_pos
+  new_seq, new_positions, new_name_to_pos = _commit_sequence(schedule, comp, new_seq)
   _logger.info(
       "gpu_collective_overlap_pass [%s]: moved %s done from pos %d to %d, before te_ep call-start %s "
       "(latency %.1f us closed by pos %d).",
@@ -1094,6 +1352,7 @@ def _try_relocate_blocker_earlier(
     start_of_done: dict,
     module_name: str = "",
     position_margins: dict | None = None,
+    guard: Optional[_WindowGuard] = None,
 ):
   """Relocate `blocker` (a non-trivial instruction pinning some collective's
   floor) and its trivial chain earlier, if it is heavy and one of two gates
@@ -1109,7 +1368,12 @@ def _try_relocate_blocker_earlier(
      Path 2 can never push a fine collective below its latency.
 
   Moving a producer earlier never breaks its consumers; the risk is stealing
-  overlap another collective relied on, which both gates guard against.
+  overlap another collective relied on, which both gates guard against. Path
+  2 only looks at the blocker's own cost, so its move, operand chain
+  included, must also pass `guard`. Path 1 must too in the guard's "window"
+  mode (it may trade one window for another); in "total" mode it is exempt,
+  since it already compared total exposed time, including the gain of the
+  async_start move it enables that the guard cannot see.
 
   Returns the new (seq, positions, name_to_pos) if a move happened, else None.
   """
@@ -1174,7 +1438,14 @@ def _try_relocate_blocker_earlier(
 
   if target is None:
     return None
-  return _commit_sequence(schedule, comp, _reinsert(seq, chain, target, blocker))
+  new_seq = _reinsert(seq, chain, target, blocker)
+  # Path 1 already judged the total exposed time of every window, crediting
+  # the move of async_start this enables (the guard, seeing only this step,
+  # would charge the cost and miss the gain), so in "total" mode it is exempt.
+  path1_exempt = improves_total and _WINDOW_GUARD_MODE == "total"
+  if not path1_exempt and not _guard_allows(guard, seq, new_seq, f"blocker relocation of {blocker.name}", module_name):
+    return None
+  return _commit_sequence(schedule, comp, new_seq)
 
 
 def _chase_async_start_blocker_toward_heavy_compute(
@@ -1187,16 +1458,17 @@ def _chase_async_start_blocker_toward_heavy_compute(
     comp_by_name: dict,
     max_hops: int,
     module_name: str = "",
+    guard: Optional[_WindowGuard] = None,
 ):
   """async-only: when async_start has no earlier legal position because its direct
   non-trivial producer (`blocker`) sits right next to it, relocate that
   blocker earlier too, repeating until the blocker is a heavy anchor
   (_is_heavy_anchor_custom_call) or has no room.
 
-  Ungated (no net-exposure or margin check): an earlier gated version existed
-  to protect other windows, but async operand producers (quantize/dbias ops)
-  are specific to that collective. If validation shows another collective
-  regressing, the gate needs to come back.
+  No net-exposure or margin check: async operand producers (quantize/dbias
+  ops) are specific to that collective. Each hop must still pass `guard`: a
+  producer pulled out of another collective's window (a te_ep dispatch's, in
+  practice) can leave it short of its latency.
 
   Returns (changed, seq, positions, name_to_pos, floor, to_move, blocker),
   with floor/to_move/blocker being async_start's current _earliest_legal_pos.
@@ -1209,7 +1481,12 @@ def _chase_async_start_blocker_toward_heavy_compute(
     blocker_pos = positions[blocker]
     if b_floor + len(b_chain) >= blocker_pos:
       break
-    seq, positions, name_to_pos = _commit_sequence(schedule, comp, _reinsert(seq, b_chain, b_floor, blocker))
+    new_seq = _reinsert(seq, b_chain, b_floor, blocker)
+    if not _guard_allows(
+        guard, seq, new_seq, f"start-blocker chase of {blocker.name} for {async_start.name}", module_name
+    ):
+      break
+    seq, positions, name_to_pos = _commit_sequence(schedule, comp, new_seq)
     changed = True
     hops += 1
     floor, to_move, blocker = _earliest_legal_pos(async_start, positions, name_to_pos, comp_by_name)
@@ -1228,6 +1505,8 @@ def _chase_exposed_collective_blocker_earlier(
     positions: dict,
     name_to_pos: dict,
     comp_by_name: dict,
+    guard: Optional[_WindowGuard] = None,
+    module_name: str = "",
 ):
   """If `blocker_done` is the done of ANOTHER still-exposed collective, try to
   move that collective's start earlier, so it sits between the caller's window
@@ -1248,13 +1527,23 @@ def _chase_exposed_collective_blocker_earlier(
   if chase_start_pos <= window_start_pos:
     return False, seq, positions, name_to_pos
   chase_floor, chase_chain, _ = _earliest_legal_pos(chase_start, positions, name_to_pos, comp_by_name)
-  target = min(max(chase_floor, window_start_pos + 1), window_done_pos)
+  if chase_floor > window_done_pos:
+    # The chased start depends on something at or after the window's done
+    # (e.g. a te_ep_dispatch start reading its te_ep_prepare window's done):
+    # capping the target at window_done_pos would put it before its operand.
+    # The old code did that and relied on schedule.update() to repair the
+    # use-before-def. A bug fix, so it has no toggle: with every
+    # COLLECTIVE_OVERLAP_* toggle of the EP-window protection off the pass is
+    # still not identical to the one before it.
+    return False, seq, positions, name_to_pos
+  target = max(chase_floor, window_start_pos + 1)
   if target + len(chase_chain) >= chase_start_pos:
     return False, seq, positions, name_to_pos
 
-  new_seq, new_positions, new_name_to_pos = _commit_sequence(
-      schedule, comp, _reinsert(seq, chase_chain, target, chase_start)
-  )
+  new_seq = _reinsert(seq, chase_chain, target, chase_start)
+  if not _guard_allows(guard, seq, new_seq, f"exposed-collective chase of {chase_start.name}", module_name):
+    return False, seq, positions, name_to_pos
+  new_seq, new_positions, new_name_to_pos = _commit_sequence(schedule, comp, new_seq)
   return True, new_seq, new_positions, new_name_to_pos
 
 
@@ -1310,6 +1599,7 @@ def _chase_heavy_compute_blocker_chain(
     module_name: str = "",
     position_margins: dict | None = None,
     is_while_body: bool = False,
+    guard: Optional[_WindowGuard] = None,
 ):
   """Relocate whatever blocks `candidate` from reaching a legal position in
   window [async_start, async_done_pos), up to `max_hops` times.
@@ -1359,6 +1649,7 @@ def _chase_heavy_compute_blocker_chain(
         start_of_done,
         module_name,
         position_margins,
+        guard,
     )
     hops += 1
     if result is None:
@@ -1422,6 +1713,239 @@ def _compute_position_margins(
   return margins
 
 
+# COLLECTIVE_OVERLAP_WINDOW_GUARD=0 disables the window guard (_WindowGuard):
+# every relocation (fill candidate with its operand chain, blocker chases,
+# async start hoists, stream-model placement, done relocation) is then checked
+# only the old way
+# (the moved instruction's own cost against the margin at its position, or
+# not at all for the start-blocker chase).
+_WINDOW_GUARD = _env_flag("COLLECTIVE_OVERLAP_WINDOW_GUARD", True)
+# Extra slack (us) the guard keeps above a window's latency: overlap short of
+# latency + this much counts as deficit (see _WINDOW_GUARD_MODE). 0 means
+# "deficit = latency - overlap".
+_WINDOW_GUARD_MARGIN_US = float(os.environ.get("COLLECTIVE_OVERLAP_WINDOW_GUARD_MARGIN_US", "0"))
+# How the guard judges a move (COLLECTIVE_OVERLAP_WINDOW_GUARD_MODE):
+#   "total" (default): reject it if the summed deficit of all windows,
+#       sum(max(0, latency + margin - overlap)), grows. A short window may
+#       shrink if others gain at least as much.
+#   "window": reject it if any window that is (or becomes) short of
+#       latency + margin loses overlap, whatever the others gain.
+_WINDOW_GUARD_MODES = ("total", "window")
+_WINDOW_GUARD_MODE = os.environ.get("COLLECTIVE_OVERLAP_WINDOW_GUARD_MODE", "total").strip().lower()
+if _WINDOW_GUARD_MODE not in _WINDOW_GUARD_MODES:
+  _WINDOW_GUARD_MODE = "total"
+# COLLECTIVE_OVERLAP_PIN_WINDOW_FILLS=1 pins every instruction the fill step
+# relocates into an under-hidden window to that window for the rest of the
+# pass (all _MAX_REORDER_ITERS iterations): the guard then rejects any later
+# move that takes it out again, whatever the slack says. Needs the guard.
+_PIN_WINDOW_FILLS = _env_flag("COLLECTIVE_OVERLAP_PIN_WINDOW_FILLS", False)
+# COLLECTIVE_OVERLAP_KEEP_BEST_ITERATION=1 snapshots the schedule after every
+# reorder iteration (and the input schedule) and, if the last one has a higher
+# total exposed time than the best, restores the best one.
+_KEEP_BEST_ITERATION = _env_flag("COLLECTIVE_OVERLAP_KEEP_BEST_ITERATION", False)
+
+# Fill pins, by computation name, then pinned instruction name -> the async
+# start whose window holds it. Persist across _reorder_collectives iterations;
+# cleared at the start of each _reorder_to_fixed_point call.
+_window_fill_pins: dict[str, dict[str, str]] = {}
+
+
+class _WindowGuard:
+  """Rejects a relocation that narrows async windows below their latency.
+
+  A window is [start + 1, done) of every async start in the computation with
+  a known latency. A move is judged on the whole new sequence, so the moved
+  instruction, the operand chain moved with it, and any start/done that
+  moves are all accounted for. With _WINDOW_GUARD_MODE "total" it is rejected
+  if the summed deficit max(0, latency + _WINDOW_GUARD_MARGIN_US - overlap)
+  of all windows grows (one window may lose hiding if others gain at least as
+  much); with "window", if any single window ends up with less overlap than
+  before and less than latency + margin. Either way it is also rejected, with
+  fill pinning, if it takes a pinned instruction out of its window.
+
+  `exempt` starts (e.g. the collective the stream model is placing, which
+  simulates its own window) are not checked.
+  """
+
+  def __init__(self, start_of_done: dict, comp_by_name: dict, comp_name: str = ""):
+    self.comp_by_name = comp_by_name
+    self.comp_name = comp_name
+    self.windows: list = []  # (start, done, latency)
+    for async_done, async_start in start_of_done.items():
+      latency = _profile_costs.get(_resolve_profile_key(async_start, comp_by_name))
+      if latency is not None and latency > 0:
+        self.windows.append((async_start, async_done, latency))
+    self.start_by_name = {s.name: s for s, _, _ in self.windows}
+    for async_done, async_start in start_of_done.items():
+      self.start_by_name.setdefault(async_start.name, async_start)
+    self.done_of_start = {s: d for d, s in start_of_done.items()}
+    # Pins committed by earlier iterations / the winning fill trial, and the
+    # ones recorded by the fill trial in progress.
+    self.pins = _window_fill_pins.setdefault(comp_name, {}) if _PIN_WINDOW_FILLS else {}
+    self.trial_pins: dict[str, str] = {}
+    self.rejections = 0
+    self._cost: dict = {}
+    self._cache: list = []  # [(seq, state)], the two most recent sequences
+
+  def _inst_cost(self, inst) -> float:
+    c = self._cost.get(inst)
+    if c is None:
+      c = _resolve_inst_cost(inst, self.comp_by_name)
+      self._cost[inst] = c
+    return c
+
+  def _state(self, seq: list):
+    """(name -> position, {start: overlap}) of `seq`."""
+    for cached_seq, state in self._cache:
+      if cached_seq is seq:
+        return state
+    name_pos = {}
+    prefix = [0.0] * (len(seq) + 1)
+    for i, inst in enumerate(seq):
+      name_pos[inst.name] = i
+      prefix[i + 1] = prefix[i] + self._inst_cost(inst)
+    overlaps = {}
+    for s, d, _ in self.windows:
+      sp, dp = name_pos.get(s.name), name_pos.get(d.name)
+      if sp is None or dp is None:
+        continue
+      overlaps[s] = prefix[dp] - prefix[sp + 1] if dp > sp + 1 else 0.0
+    self._cache = [(seq, (name_pos, overlaps))] + self._cache[:1]
+    return name_pos, overlaps
+
+  def violation(self, old_seq: list, new_seq: list, exempt=()) -> Optional[str]:
+    """Why moving from old_seq to new_seq is rejected, or None if it is allowed."""
+    if not _WINDOW_GUARD or old_seq is new_seq:
+      return None
+    old_pos, old_ov = self._state(old_seq)
+    new_pos, new_ov = self._state(new_seq)
+    old_deficit = new_deficit = 0.0
+    worst = None  # (deficit growth, start, before, after, latency)
+    for s, _, latency in self.windows:
+      if s in exempt or s not in old_ov or s not in new_ov:
+        continue
+      before, after = old_ov[s], new_ov[s]
+      need = latency + _WINDOW_GUARD_MARGIN_US
+      if _WINDOW_GUARD_MODE == "window":
+        if after < before - 1e-6 and after < need - 1e-6:
+          return f"window of {s.name} would shrink {before:.1f} -> {after:.1f} us (latency {latency:.1f} us)"
+        continue
+      d_old, d_new = max(0.0, need - before), max(0.0, need - after)
+      old_deficit += d_old
+      new_deficit += d_new
+      if worst is None or d_new - d_old > worst[0]:
+        worst = (d_new - d_old, s, before, after, latency)
+    if new_deficit > old_deficit + 1e-6:
+      _, s, before, after, latency = worst
+      return (
+          f"total window deficit would grow {old_deficit:.1f} -> {new_deficit:.1f} us (worst: window of "
+          f"{s.name} {before:.1f} -> {after:.1f} us, latency {latency:.1f} us)"
+      )
+    for pins in (self.pins, self.trial_pins):
+      for inst_name, start_name in pins.items():
+        start = self.start_by_name.get(start_name)
+        done = self.done_of_start.get(start) if start is not None else None
+        if done is None or start in exempt:
+          continue
+
+        def inside(pos, start=start, done=done, inst_name=inst_name):
+          p, sp, dp = pos.get(inst_name), pos.get(start.name), pos.get(done.name)
+          return p is not None and sp is not None and dp is not None and sp < p < dp
+
+        if inside(old_pos) and not inside(new_pos):
+          return f"{inst_name} is pinned to the window of {start_name}"
+    return None
+
+  def allows(self, old_seq: list, new_seq: list, what: str, module_name: str = "", exempt=()) -> bool:
+    """violation() as a yes/no, logging a rejection."""
+    reason = self.violation(old_seq, new_seq, exempt)
+    if reason is None:
+      return True
+    self.rejections += 1
+    _logger.debug(
+        "gpu_collective_overlap_pass [%s]: window guard rejected %s in %s: %s.",
+        module_name,
+        what,
+        self.comp_name,
+        reason,
+    )
+    return False
+
+  def record_fill(self, inst, async_start) -> None:
+    if _PIN_WINDOW_FILLS:
+      self.trial_pins[inst.name] = async_start.name
+
+  def commit_trial_pins(self, trial_pins: dict) -> None:
+    self.pins.update(trial_pins)
+    self.trial_pins = {}
+
+
+def _guard_allows(guard, old_seq: list, new_seq: list, what: str, module_name: str = "", exempt=()) -> bool:  # pylint: disable=too-many-positional-arguments
+  """True if there is no guard or it allows the move (see _WindowGuard.allows)."""
+  return guard is None or guard.allows(old_seq, new_seq, what, module_name, exempt)
+
+
+# COLLECTIVE_OVERLAP_FILL_CONSUMER_FIRST=1 fills a window whose done feeds
+# another window's start (a te_ep_prepare call feeding its te_ep_dispatch)
+# right after that consumer, instead of strictly in start order: the prepare
+# window's fill lands before the dispatch start, so if it went first it could
+# take compute the dispatch window (much longer latency) could have hidden.
+# Off by default: in the offline replay of job 3656940 it raised the
+# while-body exposed time (18.8 -> 23.3 ms, mostly region_161's P2 dispatch).
+_FILL_CONSUMER_FIRST = _env_flag("COLLECTIVE_OVERLAP_FILL_CONSUMER_FIRST", False)
+_FEEDS_START_MAX_DEPTH = 4
+
+
+def _done_feeds_start(async_done, async_start) -> bool:
+  """True if async_start reads async_done's result directly or through a few
+  get-tuple-element/bitcast-like (_TRIVIAL_SINGLE_OPCODES) instructions."""
+  frontier = list(async_start.operands())
+  seen: set = set()
+  for _ in range(_FEEDS_START_MAX_DEPTH):
+    nxt = []
+    for inst in frontier:
+      if inst == async_done:  # wrappers are not identity-stable
+        return True
+      if inst in seen:
+        continue
+      seen.add(inst)
+      if _opcode_str(inst) in _TRIVIAL_SINGLE_OPCODES:
+        nxt.extend(inst.operands())
+    frontier = nxt
+  return any(inst == async_done for inst in frontier)
+
+
+def _order_consumer_windows_first(windows: list) -> list:
+  """`windows` (in start order) with each window whose done feeds another
+  window's start moved to right after that consumer (see
+  _FILL_CONSUMER_FIRST). Chains are followed; cycles cannot occur (a start
+  follows the done it reads)."""
+  consumer_of: dict = {}
+  for w in windows:
+    for other in windows:
+      if other is not w and _done_feeds_start(w["done"], other["start"]):
+        consumer_of[id(w)] = other
+        break
+  placed: set = set()
+  ordered: list = []
+
+  def place(w):
+    if id(w) in placed:
+      return
+    placed.add(id(w))
+    ordered.append(w)
+    for feeder in windows:
+      if consumer_of.get(id(feeder)) is w:
+        place(feeder)
+
+  for w in windows:
+    if id(w) not in consumer_of:
+      place(w)
+  for w in windows:  # defensive: anything not reached keeps its place at the end
+    place(w)
+  return ordered
+
+
 _GIVE_UP_MODES = ("none", "streak", "floor_aware")
 
 
@@ -1480,6 +2004,7 @@ def _fill_exposed_collectives_with_heavy_compute(
     module_name: str,
     give_up_mode: str = "streak",
     is_while_body: bool = False,
+    guard: Optional[_WindowGuard] = None,
 ) -> tuple[bool, list, dict, dict]:
   """Pull heavy compute backward into still-exposed collective windows.
 
@@ -1499,6 +2024,10 @@ def _fill_exposed_collectives_with_heavy_compute(
   (_compute_position_margins), so a direct placement can never push another
   collective below its latency. A candidate whose floor lies past `done` goes
   to the chase fallbacks instead (see _chase_blocked).
+
+  The margin pre-filter only sees the candidate's own cost at its own
+  position; the chosen move (candidate plus the operand chain moved with it)
+  must also pass `guard`, else the candidate is skipped for this window.
 
   The deficit is recomputed from the real prefix sums on every iteration. An
   incremental "deficit -= cost" double-credited instructions that a chase
@@ -1551,6 +2080,8 @@ def _fill_exposed_collectives_with_heavy_compute(
           positions,
           name_to_pos,
           comp_by_name,
+          guard,
+          module_name,
       )
       if moved:
         chase_hops += 1
@@ -1589,6 +2120,7 @@ def _fill_exposed_collectives_with_heavy_compute(
           module_name,
           chase_margins,
           is_while_body=is_while_body,
+          guard=guard,
       )
       if moved:
         chase_hops += 1
@@ -1633,6 +2165,8 @@ def _fill_exposed_collectives_with_heavy_compute(
       break
 
     windows.sort(key=lambda w: positions[w["start"]])
+    if _FILL_CONSUMER_FIRST:
+      windows = _order_consumer_windows_first(windows)
     excluded = set(start_of_done.keys()) | set(start_of_done.values())
     # Only genuinely under-hidden collectives are chase targets, so
     # adequately overlapped ones aren't disturbed.
@@ -1766,7 +2300,19 @@ def _fill_exposed_collectives_with_heavy_compute(
 
         prev_deficit = window["deficit"]
         target = max(cand_floor, start_pos + 1)
-        seq, positions, name_to_pos = _commit_sequence(schedule, comp, _reinsert(seq, cand_chain, target, candidate))
+        new_seq = _reinsert(seq, cand_chain, target, candidate)
+        if not _guard_allows(
+            guard,
+            seq,
+            new_seq,
+            f"fill of {candidate.name} (+{len(cand_chain)} operand(s)) into window of {window['start'].name}",
+            module_name,
+        ):
+          given_up_candidates.add(candidate.name)
+          continue
+        seq, positions, name_to_pos = _commit_sequence(schedule, comp, new_seq)
+        if guard is not None:
+          guard.record_fill(candidate, window["start"])
         changed = pass_changed = True
         _logger.info(
             "gpu_collective_overlap_pass [%s]: relocated heavy compute %s (cost %.1f us) into "
@@ -1907,9 +2453,11 @@ def _fill_exposed_collectives_best_of(
     comp_by_name: dict,
     module_name: str,
     is_while_body: bool = False,
+    guard: Optional[_WindowGuard] = None,
 ) -> tuple[bool, list, dict, dict]:
   """Run the fill with each _GIVE_UP_MODES strategy from the same baseline and
-  keep the one with the lowest _total_exposed_us.
+  keep the one with the lowest _total_exposed_us. Only the winning trial's
+  fill pins (see _WindowGuard.record_fill) are kept.
 
   No strategy dominates: "streak" wins on small while bodies,
   "floor_aware" on the large entry computation. Re-entries for
@@ -1918,6 +2466,8 @@ def _fill_exposed_collectives_best_of(
   cached_mode = _fill_strategy_cache.get(comp.name)
   if cached_mode is not None:
     pre_total = _total_exposed_us(start_of_done, positions, seq, comp_by_name)
+    if guard is not None:
+      guard.trial_pins = {}
     changed, seq, positions, name_to_pos = _fill_exposed_collectives_with_heavy_compute(
         list(seq),
         schedule,
@@ -1929,7 +2479,10 @@ def _fill_exposed_collectives_best_of(
         module_name,
         give_up_mode=cached_mode,
         is_while_body=is_while_body,
+        guard=guard,
     )
+    if guard is not None:
+      guard.commit_trial_pins(guard.trial_pins)
     _logger.info(
         "gpu_collective_overlap_pass [%s]: comp %s: cached fill strategy '%s': total exposed "
         "%.1f -> %.1f us (changed=%s).",
@@ -1946,9 +2499,11 @@ def _fill_exposed_collectives_best_of(
   baseline_positions = dict(positions)
   baseline_name_to_pos = dict(name_to_pos)
 
-  best: Optional[tuple] = None  # (total_exposed, changed, seq, positions, name_to_pos, mode)
+  best: Optional[tuple] = None  # (total_exposed, changed, seq, positions, name_to_pos, mode, pins)
   for mode in _GIVE_UP_MODES:
     schedule.set_sequence(comp, list(baseline_seq))
+    if guard is not None:
+      guard.trial_pins = {}
     trial_changed, trial_seq, trial_positions, trial_name_to_pos = _fill_exposed_collectives_with_heavy_compute(
         list(baseline_seq),
         schedule,
@@ -1960,7 +2515,9 @@ def _fill_exposed_collectives_best_of(
         module_name,
         give_up_mode=mode,
         is_while_body=is_while_body,
+        guard=guard,
     )
+    trial_pins = dict(guard.trial_pins) if guard is not None else {}
     total = _total_exposed_us(start_of_done, trial_positions, trial_seq, comp_by_name)
     _logger.info(
         "gpu_collective_overlap_pass [%s]: fill strategy '%s' for comp %s: total exposed %.1f us (changed=%s).",
@@ -1971,10 +2528,12 @@ def _fill_exposed_collectives_best_of(
         trial_changed,
     )
     if best is None or total < best[0] - 1e-6:  # pylint: disable=unsubscriptable-object
-      best = (total, trial_changed, trial_seq, trial_positions, trial_name_to_pos, mode)
+      best = (total, trial_changed, trial_seq, trial_positions, trial_name_to_pos, mode, trial_pins)
 
-  total, changed, seq, positions, name_to_pos, mode = best
+  total, changed, seq, positions, name_to_pos, mode, pins = best
   schedule.set_sequence(comp, seq)
+  if guard is not None:
+    guard.commit_trial_pins(pins)
   _fill_strategy_cache[comp.name] = mode
   _logger.info(
       "gpu_collective_overlap_pass [%s]: comp %s: selected fill strategy '%s' (total exposed %.1f us).",
@@ -2202,6 +2761,7 @@ def _hoist_async_starts_to_floor(
     name_to_pos,
     comp_by_name,
     module_name,
+    guard: Optional[_WindowGuard] = None,
 ):
   """Move each async start in a while body to its earliest legal position.
 
@@ -2212,6 +2772,9 @@ def _hoist_async_starts_to_floor(
   With the stream model on, placement is chosen by _best_async_placement
   (which may also move the done); otherwise the start goes to its floor and
   the done stays put, so the window only grows.
+
+  Every move must pass `guard`; the stream model's placement is exempt only
+  for the collective it places (it simulates that window itself).
   """
   changed = False
 
@@ -2242,6 +2805,8 @@ def _hoist_async_starts_to_floor(
         )
         return False
       new_seq.insert(floor, inst)
+      if not _guard_allows(guard, seq, new_seq, f"control-predecessor hoist of {inst.name}", module_name):
+        return False
       seq, positions, name_to_pos = _commit_sequence(schedule, comp, new_seq)
       changed = True
       return True
@@ -2373,7 +2938,14 @@ def _hoist_async_starts_to_floor(
         if key[0] <= before + _ASYNC_STREAM_TOL_US:
           done_pos_old = positions[async_done]
           new_seq = base[:pb] + list(moved) + [async_start] + base[pb:q] + [async_done] + base[q:]
-          if len(new_seq) == len(seq) and set(new_seq) == set(seq) and new_seq != seq:
+          if (
+              len(new_seq) == len(seq)
+              and set(new_seq) == set(seq)
+              and new_seq != seq
+              and _guard_allows(
+                  guard, seq, new_seq, f"stream-model placement of {async_start.name}", module_name, (async_start,)
+              )
+          ):
             seq, positions, name_to_pos = _commit_sequence(schedule, comp, new_seq)
             changed = True
             _logger.info(
@@ -2391,7 +2963,10 @@ def _hoist_async_starts_to_floor(
         continue
     if floor + len(to_move) >= start_pos:
       continue
-    seq, positions, name_to_pos = _commit_sequence(schedule, comp, _reinsert(seq, to_move, floor, async_start))
+    new_seq = _reinsert(seq, to_move, floor, async_start)
+    if not _guard_allows(guard, seq, new_seq, f"hoist of {async_start.name}", module_name):
+      continue
+    seq, positions, name_to_pos = _commit_sequence(schedule, comp, new_seq)
     changed = True
     _logger.info(
         "gpu_collective_overlap_pass [%s]: hoisted %s from pos %d to %d with %d relocated operand(s).",
@@ -2439,6 +3014,7 @@ def _reorder_collectives(module, schedule, module_name: str) -> bool:
 
     positions = {inst: i for i, inst in enumerate(seq)}
     name_to_pos = {inst.name: i for inst, i in positions.items()}
+    guard = _WindowGuard(start_of_done, comp_by_name, comp.name) if _WINDOW_GUARD else None
 
     for async_done, async_start in start_of_done.items():
       profile_key = _resolve_profile_key(async_start, comp_by_name)
@@ -2471,6 +3047,7 @@ def _reorder_collectives(module, schedule, module_name: str) -> bool:
               comp_by_name,
               collective_latency,
               module_name,
+              guard,
           )
           changed = changed or done_moved
         continue
@@ -2511,6 +3088,7 @@ def _reorder_collectives(module, schedule, module_name: str) -> bool:
             comp_by_name,
             _MAX_PRODUCER_RELOCATE_HOPS,
             module_name,
+            guard,
         )
         if chased_blocker:
           changed = True
@@ -2523,7 +3101,10 @@ def _reorder_collectives(module, schedule, module_name: str) -> bool:
       if floor + len(to_move) >= async_start_pos:
         continue
 
-      seq, positions, name_to_pos = _commit_sequence(schedule, comp, _reinsert(seq, to_move, floor, async_start))
+      new_seq = _reinsert(seq, to_move, floor, async_start)
+      if not _guard_allows(guard, seq, new_seq, f"move of {async_start.name} to its floor", module_name):
+        continue
+      seq, positions, name_to_pos = _commit_sequence(schedule, comp, new_seq)
       changed = True
 
       new_overlap = sum(
@@ -2553,6 +3134,7 @@ def _reorder_collectives(module, schedule, module_name: str) -> bool:
             comp_by_name,
             collective_latency,
             module_name,
+            guard,
         )
         changed = changed or done_moved
 
@@ -2566,6 +3148,7 @@ def _reorder_collectives(module, schedule, module_name: str) -> bool:
         comp_by_name,
         module_name,
         is_while_body=is_while_body,
+        guard=guard,
     )
     changed = changed or heavy_changed
 
@@ -2579,8 +3162,18 @@ def _reorder_collectives(module, schedule, module_name: str) -> bool:
           name_to_pos,
           comp_by_name,
           module_name,
+          guard,
       )
       changed = changed or hoist_changed
+
+    if guard is not None and guard.rejections:
+      _logger.info(
+          "gpu_collective_overlap_pass [%s]: comp %s: window guard rejected %d move(s); %d fill pin(s).",
+          module_name,
+          comp.name,
+          guard.rejections,
+          len(guard.pins),
+      )
 
   return changed
 
@@ -2593,10 +3186,9 @@ def _reorder_collectives(module, schedule, module_name: str) -> bool:
 _MAX_REORDER_ITERS = 4
 
 
-def _log_final_exposed_summary(module, schedule, module_name: str, label: str) -> None:
-  """Log total and per-collective exposed time computed directly from the live
-  schedule: ground truth, since intermediate totals go stale after a later
-  schedule.update()/verify()."""
+def _module_exposed(module, schedule) -> tuple[list, list]:
+  """(per computation [(name, exposed us)], per collective [(comp name, start
+  name, exposed us)]) of the live schedule, both sorted by exposure."""
   comp_by_name = {c.name: c for c in module.computations()}
   per_comp = []
   per_collective = []  # (comp_name, collective_name, deficit_us)
@@ -2633,6 +3225,14 @@ def _log_final_exposed_summary(module, schedule, module_name: str, label: str) -
       per_comp.append((comp.name, comp_total))
   per_comp.sort(key=lambda x: -x[1])
   per_collective.sort(key=lambda x: -x[2])
+  return per_comp, per_collective
+
+
+def _log_final_exposed_summary(module, schedule, module_name: str, label: str) -> None:
+  """Log total and per-collective exposed time computed directly from the live
+  schedule: ground truth, since intermediate totals go stale after a later
+  schedule.update()/verify()."""
+  per_comp, per_collective = _module_exposed(module, schedule)
   _logger.info(
       "gpu_collective_overlap_pass [%s]: FINAL exposed summary [%s]: grand_total=%.1f us across %d computation(s): %s",
       module_name,
@@ -2707,6 +3307,46 @@ def _hoist_host_offload_copy_starts(module, schedule, module_name: str) -> bool:
   return changed
 
 
+def _snapshot_schedule(module, schedule, module_name: str, label: str) -> tuple:
+  """(total exposed us, {computation name: [instruction names]}, label)."""
+  per_comp, _ = _module_exposed(module, schedule)
+  total = sum(t for _, t in per_comp)
+  seqs = {}
+  for comp in module.make_nonfusion_computations():
+    seq = schedule.sequence(comp)
+    if seq is not None:
+      seqs[comp.name] = [inst.name for inst in seq]
+  _logger.info("gpu_collective_overlap_pass [%s]: total exposed after %s: %.1f us.", module_name, label, total)
+  return total, seqs, label
+
+
+def _restore_schedule(module, schedule, seqs: dict, module_name: str) -> bool:
+  """Set every computation's sequence back to the snapshot `seqs` (by name).
+  All or nothing: returns False, changing nothing, if a computation's
+  instruction set no longer matches its snapshot."""
+  new: list = []
+  for comp in module.make_nonfusion_computations():
+    seq = schedule.sequence(comp)
+    if seq is None:
+      continue
+    names = seqs.get(comp.name)
+    by_name = {inst.name: inst for inst in seq}
+    if names is None or len(names) != len(by_name) or any(n not in by_name for n in names):
+      _logger.warning(
+          "gpu_collective_overlap_pass [%s]: cannot restore the best schedule of %s (instruction set changed).",
+          module_name,
+          comp.name,
+      )
+      return False
+    new.append((comp, [by_name[n] for n in names]))
+  for comp, seq in new:
+    schedule.set_sequence(comp, seq)
+  schedule.update()
+  schedule.verify()
+  module.set_schedule(schedule)
+  return True
+
+
 def _reorder_to_fixed_point(module, schedule, module_name: str) -> bool:
   """Run _reorder_collectives to a fixed point; returns True if anything changed.
 
@@ -2718,14 +3358,21 @@ def _reorder_to_fixed_point(module, schedule, module_name: str) -> bool:
   """
   global _fill_strategy_cache
   _fill_strategy_cache = {}
+  _window_fill_pins.clear()
+  _inst_cost_cache.clear()
   changed = False
-  for _ in range(_MAX_REORDER_ITERS):
+  best = _snapshot_schedule(module, schedule, module_name, "input") if _KEEP_BEST_ITERATION else None
+  for it in range(_MAX_REORDER_ITERS):
     if not _reorder_collectives(module, schedule, module_name):
       break
     changed = True
     schedule.update()
     schedule.verify()
     module.set_schedule(schedule)
+    if best is not None:
+      snap = _snapshot_schedule(module, schedule, module_name, f"iteration {it + 1}")
+      if snap[0] < best[0] - 1e-6:
+        best = snap
   else:
     # Cap reached: the last update() was never rechecked, so run one more pass.
     _logger.warning(
@@ -2739,6 +3386,16 @@ def _reorder_to_fixed_point(module, schedule, module_name: str) -> bool:
       schedule.update()
       schedule.verify()
       module.set_schedule(schedule)
+  if best is not None and changed:
+    final_total = _snapshot_schedule(module, schedule, module_name, "final")[0]
+    if best[0] < final_total - 1e-6 and _restore_schedule(module, schedule, best[1], module_name):
+      _logger.info(
+          "gpu_collective_overlap_pass [%s]: restored the %s schedule (total exposed %.1f us; last iteration %.1f us).",
+          module_name,
+          best[2],
+          best[0],
+          final_total,
+      )
   if _hoist_host_offload_copy_starts(module, schedule, module_name):
     changed = True
     schedule.update()
@@ -2750,18 +3407,19 @@ def _reorder_to_fixed_point(module, schedule, module_name: str) -> bool:
 def _compute_collective_overlap(serialized_hlo: bytes) -> Optional[bytes]:
   """Reorder the schedule using the PGLE profile. Runs on rank 0 only; see
   _gpu_collective_overlap_pass."""
-  if not _profile_costs:
-    return None
-
   from jax._src.lib import hlo as _hlo  # pylint: disable=import-outside-toplevel
 
   module = _hlo.HloModule.from_serialized_hlo_module_proto(serialized_hlo)
+  module_name = module.name
+  _select_module_costs(_module_fingerprint(serialized_hlo), module_name)
+  if not _profile_costs:
+    return None
+
   schedule = module.schedule()
   if schedule is None:
     return None
 
   _register_host_offload_copies(module)
-  module_name = module.name
 
   _log_profile_coverage_gaps(module, schedule, module_name)
 
@@ -2966,7 +3624,6 @@ def _patch_pgle_profiler() -> None:
       _gemm_overrides.update(gemm_costs)
       _collective_overrides.update(coll_costs)
       _te_ep_overrides.update(te_ep_costs)
-      _profile_costs.update(te_ep_costs)
       _logger.info(
           "gpu_collective_overlap_pass: captured live per-invocation corrections: %d te_ep, %d GEMM, %d collective.",
           len(te_ep_costs),
