@@ -1756,7 +1756,7 @@ def manual_quantize(tensor: jax.Array, dtype: jax.typing.DTypeLike, calibration_
   return qpl.QArray(qvalue=q_tensor, scale=scale_tensor_qpl)
 
 
-class TEKernelAmax(nnx.Variable):
+class TEKernelAmax(nnx.Variable):  # pylint: disable=abstract-method
   """Amax (max |W|) of a TE current-scaling dense kernel as float32[1], refreshed once per training step.
 
   Not a parameter: it is derived from the kernel by `refresh_te_kernel_amaxes` and carried as layer state, so a

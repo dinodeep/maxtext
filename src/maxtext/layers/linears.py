@@ -347,7 +347,9 @@ class DenseGeneral(nnx.Module):
         and not quantizations.in_serve_mode(self.quant)
     )
     self.kernel_amax = (
-        quantizations.TEKernelAmax(quantizations.kernel_amax_like(kernel_val, self.dtype).reshape(1), out_sharding=(None,))
+        quantizations.TEKernelAmax(
+            quantizations.kernel_amax_like(kernel_val, self.dtype).reshape(1), out_sharding=(None,)
+        )
         if precompute_amax
         else None
     )
