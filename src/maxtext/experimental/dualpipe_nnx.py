@@ -1,3 +1,17 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Opt-in Llama/DeepSeek 1F1B accumulation for the normal MaxText train step.
 
 The decoder's backward/next-forward layer pair shares one scan body. Embedding
@@ -129,6 +143,7 @@ def _make_layer_adapter(layers, config, layer_name, layer_count, remat_policy=No
   each variable, with the sliced layer axis removed inside layer_apply.
   """
   # Keep heavy model dependencies out of the lightweight NNX bookkeeping tests.
+  # pylint: disable=import-outside-toplevel
   from maxtext.models.llama2 import LlamaDecoderLayer
   from maxtext.utils import maxtext_utils, maxtext_utils_nnx
 
@@ -189,7 +204,7 @@ def _make_boundaries(model, config, loss_from_logits, layer_names=("layers",)):
 
   def prefix_apply(weights, batch):
     local_model = nnx.merge(graphdef, weights, state, copy=True)
-    return local_model.decoder._apply_embedding(
+    return local_model.decoder._apply_embedding(  # pylint: disable=protected-access
         local_model.token_embedder,
         batch["inputs"],
         batch["inputs_position"],
@@ -243,6 +258,7 @@ def _restore_gradients(layer_grads, boundary_grads, param_scan_axis, layer_names
 
 def dualpipe_loss_and_grad(config, model, params_shardings, data, loss_from_logits):
   """Drop-in loss/aux/gradient result for train_step, not a separate executable."""
+  # pylint: disable-next=import-outside-toplevel
   from maxtext.utils.sharding import maybe_shard_with_logical, maybe_shard_with_name
 
   validate_training_config(config)

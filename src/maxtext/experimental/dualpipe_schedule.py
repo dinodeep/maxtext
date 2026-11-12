@@ -1,3 +1,17 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Pure-JAX layer-level 1F1B accumulation with the real training loss.
 
 The caller owns normalization and the optimizer update and jits the enclosing
@@ -532,7 +546,7 @@ def make_training_schedule(
         locs = group_locs(row, group, layers)
         side = microbatch % 2
 
-        def body(carry, loop_data, group=group, group_weights=group_weights, group_state=group_state):
+        def body(carry, loop_data, group=group, group_weights=group_weights, group_state=group_state, side=side):
           dhidden, total, saved = carry
           layer, prefetch_loc = loop_data
           # Start the next layer's host->device copy now so it overlaps this layer's backward.
@@ -761,7 +775,7 @@ def make_training_schedule(
       layer_metrics = None
       for forward, weights, state in zip(forwards, params, states):
 
-        def body(hidden, layer_data):
+        def body(hidden, layer_data, forward=forward):
           weights, state = layer_data
           with jax.named_scope("forward"):
             hidden, residuals, metrics = forward(
@@ -779,7 +793,7 @@ def make_training_schedule(
       gradient_groups = [None] * len(params)
       for group in reversed(range(len(params))):
 
-        def body(dhidden, layer_data):
+        def body(dhidden, layer_data, group=group):
           # Weights/state come from the model, not from the saved activations.
           weights, state, residual = layer_data
           with jax.named_scope("backward"):
@@ -840,7 +854,14 @@ def make_training_schedule(
       with jax.named_scope("combined_bf_layers"):
         for backward_group, forward_group, backward_stop, forward_start, length in segments:
 
-          def combined_layer(carry, index):
+          def combined_layer(
+              carry,
+              index,
+              backward_group=backward_group,
+              forward_group=forward_group,
+              backward_stop=backward_stop,
+              forward_start=forward_start,
+          ):
             dhidden, next_hidden = carry
             # A runs backward: read one saved layer input, from last layer to first.
             # Index the original array instead of making a reversed copy of it.
