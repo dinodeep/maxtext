@@ -1833,7 +1833,7 @@ class _WindowGuard:
       d_old, d_new = max(0.0, need - before), max(0.0, need - after)
       old_deficit += d_old
       new_deficit += d_new
-      if worst is None or d_new - d_old > worst[0]:
+      if worst is None or d_new - d_old > worst[0]:  # pylint: disable=unsubscriptable-object
         worst = (d_new - d_old, s, before, after, latency)
     if new_deficit > old_deficit + 1e-6:
       _, s, before, after, latency = worst
