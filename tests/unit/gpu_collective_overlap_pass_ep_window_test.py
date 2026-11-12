@@ -25,7 +25,12 @@ import re
 import unittest
 from unittest import mock
 
+import pytest
+
 from maxtext.utils import gpu_collective_overlap_pass as pass_lib
+
+# Pure-Python HLO rewriting; needs no accelerator.
+pytestmark = pytest.mark.cpu_only
 
 _FP = "d2f455245c5a61520dcabdcbc6a7ef38"
 
