@@ -44,7 +44,9 @@ def validate_training_config(config):
     # DeepSeek's frozen MoEBiasVar is already carried as read-only layer state.
     # Bias updates and auxiliary load-balancing loss are not implemented here.
     if config.load_balance_loss_weight != 0 or config.routed_bias_update_rate != 0:
-      raise ValueError("DeepSeek dual_pipe requires load_balance_loss_weight=0 and routed_bias_update_rate=0 (frozen bias)")
+      raise ValueError(
+          "DeepSeek dual_pipe requires load_balance_loss_weight=0 and routed_bias_update_rate=0 (frozen bias)"
+      )
   else:
     if config.quantization not in ("", "te_no_quant"):
       raise ValueError("Llama dual_pipe requires quantization='' or te_no_quant")
@@ -59,13 +61,24 @@ def validate_training_config(config):
   if getattr(config, "mhc_expansion_rate", 1) != 1:
     raise ValueError("dual_pipe currently requires mhc_expansion_rate=1")
   unsupported = (
-      "use_qwix_quantization", "use_manual_quantization", "quantize_kvcache",
-      "record_internal_nn_metrics", "parameter_memory_host_offload",
-      "using_pipeline_parallelism", "use_batch_split_schedule",
-      "use_multimodal", "use_audio", "learn_to_init_mode",
-      "use_tunix_gradient_accumulation", "shard_optimizer_over_data",
-      "optimizer_memory_host_offload", "use_indexer", "enable_diloco",
-      "retry_when_tokens_dropped", "use_qk_clip", "engram_layers",
+      "use_qwix_quantization",
+      "use_manual_quantization",
+      "quantize_kvcache",
+      "record_internal_nn_metrics",
+      "parameter_memory_host_offload",
+      "using_pipeline_parallelism",
+      "use_batch_split_schedule",
+      "use_multimodal",
+      "use_audio",
+      "learn_to_init_mode",
+      "use_tunix_gradient_accumulation",
+      "shard_optimizer_over_data",
+      "optimizer_memory_host_offload",
+      "use_indexer",
+      "enable_diloco",
+      "retry_when_tokens_dropped",
+      "use_qk_clip",
+      "engram_layers",
   )
   enabled = [name for name in unsupported if getattr(config, name, False)]
   if not is_deepseek and getattr(config, "routed_bias", False):
@@ -81,8 +94,10 @@ def validate_training_config(config):
 def _layer_groups(config):
   """Names and lengths of contiguous homogeneous stacks, in forward order."""
   if config.decoder_block == DecoderBlockType.DEEPSEEK:
-    groups = (("dense_layers", config.first_num_dense_layers),
-              ("moe_layers", config.num_decoder_layers - config.first_num_dense_layers))
+    groups = (
+        ("dense_layers", config.first_num_dense_layers),
+        ("moe_layers", config.num_decoder_layers - config.first_num_dense_layers),
+    )
     return tuple((name, count) for name, count in groups if count)
   return (("layers", config.num_decoder_layers),)
 
@@ -252,12 +267,12 @@ def dualpipe_loss_and_grad(config, model, params_shardings, data, loss_from_logi
   layer_names = tuple(name for name, _ in groups)
   remat_policy = local_model.decoder.get_remat_policy()
   adapters = tuple(
-      _make_layer_adapter(getattr(local_model.decoder, name), config, name, count, remat_policy)
-      for name, count in groups
+      _make_layer_adapter(getattr(local_model.decoder, name), config, name, count, remat_policy) for name, count in groups
   )
   layer_apply, layer_params, layer_state = map(tuple, zip(*adapters))
   prefix_apply, loss_apply, boundary_params = _make_boundaries(local_model, config, loss_from_logits, layer_names)
   batch = _microbatches(data, config.gradient_accumulation_steps, config.micro_batch_size_to_train_on)
+
   def constrain_residual(x):
     # Saved activations are batch-major ([batch, seq, ...] or [tokens, ...] for
     # dispatched MoE tokens); keep them sharded like the forward produced them.
@@ -265,10 +280,15 @@ def dualpipe_loss_and_grad(config, model, params_shardings, data, loss_from_logi
     return maybe_shard_with_logical(x, logical_axes, local_model.mesh, config.shard_mode)
 
   schedule = make_training_schedule(
-      prefix_apply, layer_apply, loss_apply, grad_dtype=config.grad_dtype,
+      prefix_apply,
+      layer_apply,
+      loss_apply,
+      grad_dtype=config.grad_dtype,
       checkpointed_layers=config.remat_policy != "none",
       constrain_residual=constrain_residual,
-      layer_loop_context=(lambda: model_loop_unroll_context(config)) if config.dual_pipe_double_buffer_layer_loops else None,
+      layer_loop_context=(lambda: model_loop_unroll_context(config))
+      if config.dual_pipe_double_buffer_layer_loops
+      else None,
   )
   with jax.named_scope("dual_pipe"):
     loss_sum, aux, layer_grads, boundary_grads = schedule(layer_params, layer_state, boundary_params, batch)
@@ -283,11 +303,15 @@ def dualpipe_loss_and_grad(config, model, params_shardings, data, loss_from_logi
   has_weights = aux["total_weights"] > 0
   denominator = jnp.maximum(aux["total_weights"], 1)
   loss = jnp.where(has_weights, loss_sum / denominator, 0.0)
-  raw_grads = jax.tree.map(
-      lambda x: jnp.where(has_weights, x / denominator, jnp.zeros_like(x)), raw_grads
-  )
+  raw_grads = jax.tree.map(lambda x: jnp.where(has_weights, x / denominator, jnp.zeros_like(x)), raw_grads)
   aux.update(
-      intermediate_outputs={}, moe_lb_loss=0.0, indexer_loss=0.0, mtp_loss=0.0,
-      moe_bias_updates=None, mtp_moe_bias_updates=None, batch_stats=None, has_moe_overflow=jnp.bool_(False),
+      intermediate_outputs={},
+      moe_lb_loss=0.0,
+      indexer_loss=0.0,
+      mtp_loss=0.0,
+      moe_bias_updates=None,
+      mtp_moe_bias_updates=None,
+      batch_stats=None,
+      has_moe_overflow=jnp.bool_(False),
   )
   return loss, aux, raw_grads

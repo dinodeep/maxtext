@@ -44,7 +44,9 @@ class _ResidualLayout:
 
   def matches(self, other):
     return (
-        self.sources == other.sources and self.saved_avals == other.saved_avals and self.kept == other.kept
+        self.sources == other.sources
+        and self.saved_avals == other.saved_avals
+        and self.kept == other.kept
         and self.needs_hidden == other.needs_hidden
     )
 
@@ -94,9 +96,7 @@ def _checkpointed_layer_passes(apply):
     return jax.tree.leaves((weights, hidden, state, positions, segments))
 
   def forward(weights, hidden, state, positions, segments):
-    out, pullback, metrics = jax.vjp(
-        lambda w, x: apply(w, x, state, positions, segments), weights, hidden, has_aux=True
-    )
+    out, pullback, metrics = jax.vjp(lambda w, x: apply(w, x, state, positions, segments), weights, hidden, has_aux=True)
     leaves, treedef = jax.tree.flatten(pullback)
     index = {id(x): i for i, x in enumerate(inputs_of(weights, hidden, state, positions, segments))}
     sources = tuple(index.get(id(leaf)) for leaf in leaves)
@@ -182,8 +182,15 @@ def _slot_tables(microbatches, layer_pool, pool_count):
 
 
 def make_training_schedule(
-    prefix_apply, layer_apply, loss_apply, schedule="dual_pipe", grad_dtype=jnp.float32, checkpointed_layers=False,
-    constrain_residual=None, anchor_segments=None, layer_loop_context=None,
+    prefix_apply,
+    layer_apply,
+    loss_apply,
+    schedule="dual_pipe",
+    grad_dtype=jnp.float32,
+    checkpointed_layers=False,
+    constrain_residual=None,
+    anchor_segments=None,
+    layer_loop_context=None,
 ):
   """Build a serial or fused layer-level 1F1B loss/gradient computation.
 
@@ -256,6 +263,7 @@ def make_training_schedule(
     raise TypeError("Layer callbacks must be a tuple, one per group")
   if not layer_apply:
     raise ValueError("At least one layer group is required")
+
   def make_layer_passes(apply):
     # Keep the existing behavior when the layers are not checkpointed.
     if not checkpointed_layers:
@@ -275,7 +283,14 @@ def make_training_schedule(
   loss_and_grad = jax.jit(jax.value_and_grad(loss_apply, argnums=(0, 1), has_aux=True), inline=True)
 
   def _pooled_residual_step(
-      params, states, boundary_params, microbatch_data, boundaries, segments, accumulate, sum_aux,
+      params,
+      states,
+      boundary_params,
+      microbatch_data,
+      boundaries,
+      segments,
+      accumulate,
+      sum_aux,
       merge_layer_metrics,
   ):
     """1F1B for checkpointed layers with shared residual slot pools and in-place gradient sums.
@@ -309,8 +324,11 @@ def make_training_schedule(
     for group in range(len(params)):
       jax.eval_shape(
           lambda g=group: forwards[g](
-              take(params[g], 0), jnp.zeros(hidden_shape.shape, hidden_shape.dtype), take(states[g], 0),
-              first_data["inputs_position"], first_data["inputs_segmentation"],
+              take(params[g], 0),
+              jnp.zeros(hidden_shape.shape, hidden_shape.dtype),
+              take(states[g], 0),
+              first_data["inputs_position"],
+              first_data["inputs_segmentation"],
           )
       )
       saved_layouts.append(residual_layouts[group][0].saved_avals)
@@ -335,8 +353,13 @@ def make_training_schedule(
     for pool, layout in enumerate(pool_layouts):
       groups = [g for g in range(len(params)) if group_pool[g] == pool]
       logging.info(
-          "dual_pipe residual pool %d: groups %s, %d slots of %s", pool, groups, pool_sizes[pool],
-          ", ".join(f"{dtype}[{','.join(map(str, shape))}]@{getattr(space, 'name', space)}" for shape, dtype, space in layout),
+          "dual_pipe residual pool %d: groups %s, %d slots of %s",
+          pool,
+          groups,
+          pool_sizes[pool],
+          ", ".join(
+              f"{dtype}[{','.join(map(str, shape))}]@{getattr(space, 'name', space)}" for shape, dtype, space in layout
+          ),
       )
 
     fill_count = itertools.count(1)
@@ -355,7 +378,8 @@ def make_training_schedule(
     host_bytes = sum(
         2 * pool_layer_count[pool] * int(np.prod(shape)) * jnp.dtype(dtype).itemsize
         for pool, layout in enumerate(pool_layouts)
-        for (shape, dtype, _), host in zip(layout, is_host[pool]) if host
+        for (shape, dtype, _), host in zip(layout, is_host[pool])
+        if host
     )
     if host_bytes:
       # Shapes are global. Offloaded residuals are batch/token sharded, so a process holds about
@@ -364,14 +388,16 @@ def make_training_schedule(
       logging.info(
           "dual_pipe host residual pools: %.1f GiB global (2 ping-pong buffers per offloaded tensor), ~%.1f GiB "
           "pinned host memory per process if sharded over all devices (a shared single buffer would need half)",
-          host_bytes / 2**30, per_process / 2**30,
+          host_bytes / 2**30,
+          per_process / 2**30,
       )
       limit_gb = os.environ.get("XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB")
       if limit_gb and per_process / 2**30 > float(limit_gb):
         logging.warning(
             "dual_pipe host residual pools (~%.1f GiB per process) exceed XLA_PJRT_GPU_HOST_MEMORY_LIMIT_GB=%s; "
             "raise the limit, offload fewer residuals, or use fewer layers per device",
-            per_process / 2**30, limit_gb,
+            per_process / 2**30,
+            limit_gb,
         )
 
     def new_pool(pool):
@@ -391,9 +417,7 @@ def make_training_schedule(
     def constrain(values, pool):
       if constrain_residual is None:
         return values
-      return tuple(
-          x if host else constrain_residual(x) for x, host in zip(values, is_host[pool])
-      )
+      return tuple(x if host else constrain_residual(x) for x, host in zip(values, is_host[pool]))
 
     def read(pools, group, loc, side):
       """Residuals at loc = (shared slot, layer rank); host buffers use `side`, device buffers the slot."""
@@ -439,7 +463,7 @@ def make_training_schedule(
       saved, updated = list(saved), list(pools[pool])
       for i, value, buffer in zip(device, saved_device, buffers):
         saved[i], updated[i] = value, buffer
-      return tuple(saved), tuple(pools[:pool]) + (tuple(updated),) + tuple(pools[pool + 1:])
+      return tuple(saved), tuple(pools[:pool]) + (tuple(updated),) + tuple(pools[pool + 1 :])
 
     def group_locs(row, group, layers):
       """[len(layers), 2] int32 of (shared slot, layer rank in pool) for group-local `layers`."""
@@ -483,9 +507,7 @@ def make_training_schedule(
           hidden, pools = carry
           weights, state, loc = layer_data
           with jax.named_scope("forward"):
-            hidden, saved, metrics = forward(
-                weights, hidden, state, data["inputs_position"], data["inputs_segmentation"]
-            )
+            hidden, saved, metrics = forward(weights, hidden, state, data["inputs_position"], data["inputs_segmentation"])
           pools = write(pools, group, loc, microbatch % 2, saved)
           return (hidden, pools), metrics
 
@@ -523,7 +545,8 @@ def make_training_schedule(
           return (dhidden, add_layer(total, dweights, layer), next_saved), None
 
         (dhidden, layer_sums[group], _), _ = layer_scan(
-            body, (dhidden, layer_sums[group], read(pools, group, locs[0], side)),
+            body,
+            (dhidden, layer_sums[group], read(pools, group, locs[0], side)),
             (jnp.asarray(layers, jnp.int32), next_slots(locs)),
         )
       return dhidden, tuple(layer_sums)
@@ -533,15 +556,12 @@ def make_training_schedule(
     pools = tuple(new_pool(pool) for pool in range(len(pool_layouts)))
 
     with jax.named_scope("fill_F0"):
-      prefix_residuals, pools, dhidden, loss_total, aux_total, head_grads = forward_microbatch(
-          first_data, pools, 0
-      )
+      prefix_residuals, pools, dhidden, loss_total, aux_total, head_grads = forward_microbatch(first_data, pools, 0)
     boundary_total = accumulate(boundary_total, head_grads)
 
     def backward_forward(carry, data, microbatch):
       """B of microbatch-1 fused with F of `microbatch` (a static index)."""
-      (prev_prefix_residuals, pools, prev_dhidden, prev_data, loss_sum, aux_sum, layer_sum,
-       boundary_sum) = carry
+      (prev_prefix_residuals, pools, prev_dhidden, prev_data, loss_sum, aux_sum, layer_sum, boundary_sum) = carry
       with jax.named_scope("prefix_forward"):
         next_hidden, next_prefix_residuals = prefix_forward(boundary_params, data)
       layer_sum = list(layer_sum)
@@ -556,15 +576,23 @@ def make_training_schedule(
               (params[backward_group], states[backward_group]), (dprefix, next_hidden)
           )
           forward_params, forward_states = (
-              (backward_params, backward_states) if forward_group == backward_group
+              (backward_params, backward_states)
+              if forward_group == backward_group
               else anchored((params[forward_group], states[forward_group]), (dprefix, next_hidden))
           )
 
           read_locs = group_locs(read_row, backward_group, backward_layers)
 
-          def combined_layer(carry, loop_data, backward_group=backward_group, forward_group=forward_group,
-                             backward_params=backward_params, backward_states=backward_states,
-                             forward_params=forward_params, forward_states=forward_states):
+          def combined_layer(
+              carry,
+              loop_data,
+              backward_group=backward_group,
+              forward_group=forward_group,
+              backward_params=backward_params,
+              backward_states=backward_states,
+              forward_params=forward_params,
+              forward_states=forward_states,
+          ):
             dhidden, next_hidden, pools, total, saved = carry
             backward_layer, forward_layer, prefetch_loc, write_loc = loop_data
             # Prefetch the next backward layer's residuals (host->device) so the copy overlaps
@@ -582,8 +610,12 @@ def make_training_schedule(
               next_weights, next_state = take((forward_params, forward_states), forward_layer)
             with jax.named_scope("backward"):
               dweights, dhidden = backwards[backward_group](
-                  backward_weights, backward_state, prev_data["inputs_position"], prev_data["inputs_segmentation"],
-                  saved, dhidden,
+                  backward_weights,
+                  backward_state,
+                  prev_data["inputs_position"],
+                  prev_data["inputs_segmentation"],
+                  saved,
+                  dhidden,
               )
             with jax.named_scope("forward"):
               next_hidden, next_saved_fwd, metrics = forwards[forward_group](
@@ -607,21 +639,31 @@ def make_training_schedule(
           (dprefix, next_hidden, pools, layer_sum[backward_group], _), metrics = layer_scan(
               combined_layer,
               (dprefix, next_hidden, pools, layer_sum[backward_group], first_saved),
-              (jnp.asarray(backward_layers, jnp.int32), jnp.asarray(forward_layers, jnp.int32),
-               next_slots(read_locs), group_locs(write_row, forward_group, forward_layers)),
+              (
+                  jnp.asarray(backward_layers, jnp.int32),
+                  jnp.asarray(forward_layers, jnp.int32),
+                  next_slots(read_locs),
+                  group_locs(write_row, forward_group, forward_layers),
+              ),
           )
           metrics = _reduce_aux(metrics)
           layer_metrics = metrics if layer_metrics is None else sum_aux(layer_metrics, metrics)
 
       with jax.named_scope("prefix_backward"):
-        prefix_grads, = prefix_backward(prev_prefix_residuals, dprefix)
+        (prefix_grads,) = prefix_backward(prev_prefix_residuals, dprefix)
       with jax.named_scope("head_loss_and_backward"):
         (loss, aux), (head_grads, next_dhidden) = loss_and_grad(boundary_params, next_hidden, data)
       aux = merge_layer_metrics(aux, layer_metrics)
       boundary_sum = accumulate(accumulate(boundary_sum, prefix_grads), head_grads)
       return (
-          next_prefix_residuals, pools, next_dhidden, data, loss_sum + loss, sum_aux(aux_sum, aux),
-          tuple(layer_sum), boundary_sum,
+          next_prefix_residuals,
+          pools,
+          next_dhidden,
+          data,
+          loss_sum + loss,
+          sum_aux(aux_sum, aux),
+          tuple(layer_sum),
+          boundary_sum,
       )
 
     carry = (prefix_residuals, pools, dhidden, first_data, loss_total, aux_total, layer_total, boundary_total)
@@ -643,14 +685,15 @@ def make_training_schedule(
       if not periodic and microbatches - first_leftover > 4:
         logging.warning(
             "dual_pipe: residual slot tables are not period-2, so %d microbatch steps are unrolled in the "
-            "program; compile time and program size grow with gradient_accumulation_steps", microbatches - first_leftover,
+            "program; compile time and program size grow with gradient_accumulation_steps",
+            microbatches - first_leftover,
         )
       for microbatch in range(first_leftover, microbatches):
         carry = backward_forward(carry, jax.tree.map(lambda x, m=microbatch: x[m - 1], later_data), microbatch)
     prefix_residuals, pools, dhidden, last_data, loss_total, aux_total, layer_total, boundary_total = carry
     with jax.named_scope("drain_Blast"):
       dprefix, layer_total = backward_microbatch(pools, microbatches - 1, dhidden, last_data, layer_total)
-      prefix_grads, = prefix_backward(prefix_residuals, dprefix)
+      (prefix_grads,) = prefix_backward(prefix_residuals, dprefix)
     return loss_total, aux_total, layer_total, accumulate(boundary_total, prefix_grads)
 
   def step(layer_params, layer_state, boundary_params, microbatch_data):
@@ -660,7 +703,12 @@ def make_training_schedule(
     if any(x.shape[0] != microbatches for x in jax.tree.leaves(microbatch_data)):
       raise ValueError("All input leaves must have the same leading microbatch axis")
     params, states = layer_params, layer_state
-    if not isinstance(params, tuple) or not isinstance(states, tuple) or len(params) != len(forwards) or len(states) != len(forwards):
+    if (
+        not isinstance(params, tuple)
+        or not isinstance(states, tuple)
+        or len(params) != len(forwards)
+        or len(states) != len(forwards)
+    ):
       raise ValueError("Grouped layer callbacks require matching parameter/state tuples")
     boundaries = [0]
     for group_params in params:
@@ -697,7 +745,14 @@ def make_training_schedule(
 
     if checkpointed_layers and schedule == "dual_pipe":
       return _pooled_residual_step(
-          params, states, boundary_params, microbatch_data, boundaries, segments, accumulate, sum_aux,
+          params,
+          states,
+          boundary_params,
+          microbatch_data,
+          boundaries,
+          segments,
+          accumulate,
+          sum_aux,
           merge_layer_metrics,
       )
 
@@ -705,6 +760,7 @@ def make_training_schedule(
       residual_groups = []
       layer_metrics = None
       for forward, weights, state in zip(forwards, params, states):
+
         def body(hidden, layer_data):
           weights, state = layer_data
           with jax.named_scope("forward"):
@@ -722,6 +778,7 @@ def make_training_schedule(
     def backward_layers(residuals, dhidden):
       gradient_groups = [None] * len(params)
       for group in reversed(range(len(params))):
+
         def body(dhidden, layer_data):
           # Weights/state come from the model, not from the saved activations.
           weights, state, residual = layer_data
@@ -755,7 +812,7 @@ def make_training_schedule(
     if schedule == "serial" or microbatches == 1:
       with jax.named_scope("serial_B0"):
         dprefix, layer_grads = backward_layers(residuals, dhidden)
-        prefix_grads, = prefix_backward(prefix_residuals, dprefix)
+        (prefix_grads,) = prefix_backward(prefix_residuals, dprefix)
       layer_total = accumulate(layer_total, layer_grads)
       boundary_total = accumulate(boundary_total, prefix_grads)
 
@@ -764,14 +821,12 @@ def make_training_schedule(
         prefix_res, layer_res, dy, loss, aux, head_grads = forward_microbatch(data)
         dprefix, layer_grads = backward_layers(layer_res, dy)
         with jax.named_scope("prefix_backward"):
-          prefix_grads, = prefix_backward(prefix_res, dprefix)
+          (prefix_grads,) = prefix_backward(prefix_res, dprefix)
         boundary_sum = accumulate(accumulate(boundary_sum, head_grads), prefix_grads)
         return (loss_sum + loss, sum_aux(aux_sum, aux), accumulate(layer_sum, layer_grads), boundary_sum), None
 
       with jax.named_scope("serial_FB"):
-        totals, _ = jax.lax.scan(
-            serial_microbatch, (loss_total, aux_total, layer_total, boundary_total), later_data
-        )
+        totals, _ = jax.lax.scan(serial_microbatch, (loss_total, aux_total, layer_total, boundary_total), later_data)
       return totals
 
     def backward_forward(carry, data):
@@ -784,6 +839,7 @@ def make_training_schedule(
       dprefix = previous_dhidden
       with jax.named_scope("combined_bf_layers"):
         for backward_group, forward_group, backward_stop, forward_start, length in segments:
+
           def combined_layer(carry, index):
             dhidden, next_hidden = carry
             # A runs backward: read one saved layer input, from last layer to first.
@@ -831,7 +887,7 @@ def make_training_schedule(
       layer_grads = tuple(concatenate(list(reversed(parts))) for parts in gradient_parts)
       next_residuals = tuple(concatenate(parts) for parts in residual_parts)
       with jax.named_scope("prefix_backward"):
-        prefix_grads, = prefix_backward(previous_prefix_residuals, dprefix)
+        (prefix_grads,) = prefix_backward(previous_prefix_residuals, dprefix)
       with jax.named_scope("head_loss_and_backward"):
         (loss, aux), (head_grads, next_dhidden) = loss_and_grad(boundary_params, next_hidden, data)
       aux = merge_layer_metrics(aux, layer_metrics)
@@ -857,7 +913,7 @@ def make_training_schedule(
     prefix_residuals, residuals, dhidden, loss_total, aux_total, layer_total, boundary_total = carry
     with jax.named_scope("drain_Blast"):
       dprefix, layer_grads = backward_layers(residuals, dhidden)
-      prefix_grads, = prefix_backward(prefix_residuals, dprefix)
+      (prefix_grads,) = prefix_backward(prefix_residuals, dprefix)
     return loss_total, aux_total, accumulate(layer_total, layer_grads), accumulate(boundary_total, prefix_grads)
 
   return step

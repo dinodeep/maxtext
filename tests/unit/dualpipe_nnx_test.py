@@ -15,8 +15,13 @@ import optax
 
 from maxtext.common.common_types import DecoderBlockType, ShardMode
 from maxtext.experimental.dualpipe_nnx import (
-    _layer_groups, _make_boundaries, _make_layer_adapter, _microbatches, _restore_gradients,
-    _te_layer_metrics, validate_training_config,
+    _layer_groups,
+    _make_boundaries,
+    _make_layer_adapter,
+    _microbatches,
+    _restore_gradients,
+    _te_layer_metrics,
+    validate_training_config,
 )
 from maxtext.experimental.dualpipe_schedule import _reduce_aux, make_training_schedule
 from maxtext.layers import nnx_scan
@@ -24,11 +29,13 @@ from maxtext.utils.globals import EPS
 
 
 class TinyEmbedding(nnx.Module):
+
   def __init__(self):
     self.embedding = nnx.Param(jax.random.normal(jax.random.key(0), (7, 4)) * 0.2, out_sharding=("vocab", "embed"))
 
 
 class TinyLayerStack(nnx.Module):
+
   def __init__(self, layers, scan_axis):
     kernel = jax.random.normal(jax.random.key(1), (layers, 4, 4)) * 0.2
     bias = jax.random.normal(jax.random.key(2), (layers, 4)) * 0.1
@@ -70,13 +77,12 @@ def frozen_expert_output(hidden, gate, experts, bias):
 
 
 class TinyFrozenExpertLayer(nnx.Module):
+
   def __init__(self, rngs):
     self.gate = nnx.Module()
-    self.gate.kernel = nnx.Param(jax.random.normal(rngs.params(), (4, 3)) * 0.2,
-                                 out_sharding=("embed", "expert"))
+    self.gate.kernel = nnx.Param(jax.random.normal(rngs.params(), (4, 3)) * 0.2, out_sharding=("embed", "expert"))
     self.gate.bias = FrozenRouterBias(jnp.zeros((3,)), out_sharding=("expert",))
-    self.experts = nnx.Param(jax.random.normal(rngs.params(), (3, 4, 4)) * 0.2,
-                             out_sharding=("expert", "embed", "mlp"))
+    self.experts = nnx.Param(jax.random.normal(rngs.params(), (3, 4, 4)) * 0.2, out_sharding=("expert", "embed", "mlp"))
 
   def __call__(self, hidden, *, decoder_segment_ids, decoder_positions, deterministic, model_mode):
     del decoder_segment_ids, decoder_positions, deterministic, model_mode
@@ -91,6 +97,7 @@ class TinyFrozenExpertLayer(nnx.Module):
 
 
 class TinyDecoder(nnx.Module):
+
   def __init__(self, layers, scan_axis):
     self.layers = TinyLayerStack(layers, scan_axis)
     self.prefix_scale = nnx.Param(jnp.full((4,), 1.1), out_sharding=("embed",))
@@ -107,6 +114,7 @@ class TinyDecoder(nnx.Module):
 
 
 class TinyTransformer(nnx.Module):
+
   def __init__(self, layers=3, scan_axis=1):
     self.token_embedder = TinyEmbedding()
     self.decoder = TinyDecoder(layers, scan_axis)
@@ -149,16 +157,29 @@ def make_data(microbatches, empty=False):
 
 def deepseek_config(**overrides):
   values = dict(
-      decoder_block=DecoderBlockType.DEEPSEEK, scan_layers=True, inhomogeneous_layer_cycle_interval=1,
-      num_decoder_layers=4, first_num_dense_layers=1, shard_mode=ShardMode.AUTO,
-      remat_policy="full", dropout_rate=0, quantization="te_no_quant", num_experts=16, mtp_num_layers=0,
-      te_moe_block=True, te_gmm_quantization="te_no_quant", load_balance_loss_weight=0,
-      routed_bias=False, routed_bias_update_rate=0, num_vocab_tiling=1,
+      decoder_block=DecoderBlockType.DEEPSEEK,
+      scan_layers=True,
+      inhomogeneous_layer_cycle_interval=1,
+      num_decoder_layers=4,
+      first_num_dense_layers=1,
+      shard_mode=ShardMode.AUTO,
+      remat_policy="full",
+      dropout_rate=0,
+      quantization="te_no_quant",
+      num_experts=16,
+      mtp_num_layers=0,
+      te_moe_block=True,
+      te_gmm_quantization="te_no_quant",
+      load_balance_loss_weight=0,
+      routed_bias=False,
+      routed_bias_update_rate=0,
+      num_vocab_tiling=1,
   )
   return SimpleNamespace(**{**values, **overrides})
 
 
 class DenseTrainingNnxTest(unittest.TestCase):
+
   def setUp(self):
     super().setUp()
     mesh = jax.sharding.Mesh(
@@ -221,7 +242,9 @@ class DenseTrainingNnxTest(unittest.TestCase):
         boundary_grads = jax.tree.map(lambda x: x * 2, boundary)
         restored = _restore_gradients((leading_layers,), boundary_grads, scan_axis)
         self.assert_tree_allclose(restored, jax.tree.map(lambda x: x * 2, params))
-        self.assertEqual(restored["decoder"]["layers"]["kernel"].get_metadata(), params["decoder"]["layers"]["kernel"].get_metadata())
+        self.assertEqual(
+            restored["decoder"]["layers"]["kernel"].get_metadata(), params["decoder"]["layers"]["kernel"].get_metadata()
+        )
 
   def test_microbatch_order_matches_normal_ga_and_slices_padding(self):
     data = make_data(3)
@@ -257,7 +280,11 @@ class DenseTrainingNnxTest(unittest.TestCase):
             for mb in range(microbatches):
               batch = jax.tree.map(lambda x: x[mb], data)
               hidden = local_model.decoder._apply_embedding(
-                  local_model.token_embedder, batch["inputs"], batch["inputs_position"], deterministic=True, model_mode="train"
+                  local_model.token_embedder,
+                  batch["inputs"],
+                  batch["inputs_position"],
+                  deterministic=True,
+                  model_mode="train",
               )
               stack = local_model.decoder.layers
               for layer in range(3):
@@ -273,7 +300,9 @@ class DenseTrainingNnxTest(unittest.TestCase):
 
           reference_value, reference_grads = jax.jit(jax.value_and_grad(reference))(all_params)
           schedule = make_training_schedule(prefix, (layer_apply,), head)
-          loss_sum, aux, layer_grads, boundary_grads = jax.jit(schedule)((layer_params,), (layer_state,), boundary_params, data)
+          loss_sum, aux, layer_grads, boundary_grads = jax.jit(schedule)(
+              (layer_params,), (layer_state,), boundary_params, data
+          )
           grads = _restore_gradients(layer_grads, boundary_grads, param_scan_axis=1)
           denominator = jnp.maximum(aux["total_weights"], 1)
           grads = jax.tree.map(lambda x: x / denominator, grads)
@@ -308,15 +337,19 @@ class DenseTrainingNnxTest(unittest.TestCase):
           for mb in range(3):
             batch = jax.tree.map(lambda x: x[mb], data)
             hidden = local_model.decoder._apply_embedding(
-                local_model.token_embedder, batch["inputs"], batch["inputs_position"],
-                deterministic=True, model_mode="train",
+                local_model.token_embedder,
+                batch["inputs"],
+                batch["inputs_position"],
+                deterministic=True,
+                model_mode="train",
             )
             for name, count, apply in zip(names, (1, 3), (layer_apply, expert_apply)):
               _, weights, state = nnx.split(getattr(local_model.decoder, name), nnx.Param, ...)
               weights = jax.tree.map(lambda x: jnp.moveaxis(x, scan_axis, 0), weights)
               for index in range(count):
-                hidden, _ = apply(jax.tree.map(lambda x: x[index], weights), hidden,
-                                  jax.tree.map(lambda x: x[index], state), None, None)
+                hidden, _ = apply(
+                    jax.tree.map(lambda x: x[index], weights), hidden, jax.tree.map(lambda x: x[index], state), None, None
+                )
             logits = local_model.decoder.apply_output_head(
                 local_model.token_embedder, hidden, deterministic=True, model_mode="train"
             )
@@ -324,12 +357,11 @@ class DenseTrainingNnxTest(unittest.TestCase):
           return total
 
         expected_loss, expected_grads = jax.jit(jax.value_and_grad(reference))(all_params)
-        checkpointed = tuple(jax.checkpoint(f, policy=jax.checkpoint_policies.nothing_saveable)
-                             for f in (layer_apply, expert_apply))
-        schedule = make_training_schedule(prefix, checkpointed, head)
-        loss, _, group_grads, boundary_grads = jax.jit(schedule)(
-            tuple(group_params), tuple(group_states), boundary, data
+        checkpointed = tuple(
+            jax.checkpoint(f, policy=jax.checkpoint_policies.nothing_saveable) for f in (layer_apply, expert_apply)
         )
+        schedule = make_training_schedule(prefix, checkpointed, head)
+        loss, _, group_grads, boundary_grads = jax.jit(schedule)(tuple(group_params), tuple(group_states), boundary, data)
         grads = _restore_gradients(group_grads, boundary_grads, scan_axis, names)
         np.testing.assert_allclose(loss, expected_loss, rtol=2e-5)
         self.assert_tree_allclose(grads, expected_grads)
@@ -358,7 +390,8 @@ class DenseTrainingNnxTest(unittest.TestCase):
     model_modules = {
         "maxtext.models.llama2": SimpleNamespace(LlamaDecoderLayer=TinyFrozenExpertLayer),
         "maxtext.models.deepseek": SimpleNamespace(
-            DeepSeekDenseLayer=TinyFrozenExpertLayer, DeepSeekMoELayer=TinyFrozenExpertLayer),
+            DeepSeekDenseLayer=TinyFrozenExpertLayer, DeepSeekMoELayer=TinyFrozenExpertLayer
+        ),
     }
     bias_values = jnp.array([[0.5, -0.2, -0.3], [-0.2, 0.5, -0.3], [-0.3, -0.2, 0.5]])
     recipes = (("te_no_quant", "te_no_quant"), ("te_fp8_currentscaling", "te_mxfp8"))
@@ -367,8 +400,11 @@ class DenseTrainingNnxTest(unittest.TestCase):
         model = TinyTransformer()
         del model.decoder.layers
         stack = nnx_scan.create_scanned_layers(
-            TinyFrozenExpertLayer, length=3, param_scan_axis=scan_axis,
-            metadata_axis_name="moe_layers", rngs=nnx.Rngs(7),
+            TinyFrozenExpertLayer,
+            length=3,
+            param_scan_axis=scan_axis,
+            metadata_axis_name="moe_layers",
+            rngs=nnx.Rngs(7),
         )
         stack.gate.bias[...] = bias_values
         model.decoder.moe_layers = stack
@@ -381,13 +417,22 @@ class DenseTrainingNnxTest(unittest.TestCase):
         # Accepted recipes must not change the adapter's frozen-state handling.
         # The tiny layer does not emulate or validate TE quantization kernels.
         config = deepseek_config(
-            param_scan_axis=scan_axis, num_decoder_layers=3, first_num_dense_layers=0,
-            routed_bias=True, quantization=quantization, te_gmm_quantization=te_gmm_quantization,
+            param_scan_axis=scan_axis,
+            num_decoder_layers=3,
+            first_num_dense_layers=0,
+            routed_bias=True,
+            quantization=quantization,
+            te_gmm_quantization=te_gmm_quantization,
         )
         validate_training_config(config)
-        with mock.patch.dict(sys.modules, model_modules), mock.patch.multiple(
-            "maxtext.utils", create=True, maxtext_utils_nnx=maxtext_utils_nnx,
-            maxtext_utils=SimpleNamespace(should_prevent_cse_in_remat=lambda _: False),
+        with (
+            mock.patch.dict(sys.modules, model_modules),
+            mock.patch.multiple(
+                "maxtext.utils",
+                create=True,
+                maxtext_utils_nnx=maxtext_utils_nnx,
+                maxtext_utils=SimpleNamespace(should_prevent_cse_in_remat=lambda _: False),
+            ),
         ):
           apply, params, state = _make_layer_adapter(stack, config, "moe_layers", 3)
         prefix, head, boundary = _make_boundaries(model, config, loss_from_logits, ("moe_layers",))
@@ -414,7 +459,10 @@ class DenseTrainingNnxTest(unittest.TestCase):
         for schedule_name in ("serial", "dual_pipe"):
           with self.subTest(schedule=schedule_name):
             schedule = make_training_schedule(
-                prefix, (apply,), head, schedule=schedule_name,
+                prefix,
+                (apply,),
+                head,
+                schedule=schedule_name,
             )
             loss, _, layer_grads, boundary_grads = jax.jit(schedule)((params,), (state,), boundary, data)
             grads = _restore_gradients(layer_grads, boundary_grads, scan_axis, ("moe_layers",))
@@ -425,8 +473,9 @@ class DenseTrainingNnxTest(unittest.TestCase):
             updated_model = nnx.clone(model)
             optimizer = nnx.Optimizer(updated_model, optax.sgd(0.01), wrt=nnx.Param)
             optimizer.update(updated_model, grads)
-            self.assert_tree_allclose(nnx.state(updated_model, nnx.Param),
-                                     jax.tree.map(lambda p, g: p - 0.01 * g, all_params, expected_grads))
+            self.assert_tree_allclose(
+                nnx.state(updated_model, nnx.Param), jax.tree.map(lambda p, g: p - 0.01 * g, all_params, expected_grads)
+            )
             self.assert_tree_allclose(nnx.state(updated_model, nnx.Not(nnx.Param)), original_state)
 
   def test_deepseek_validation_and_group_layout(self):
@@ -438,13 +487,23 @@ class DenseTrainingNnxTest(unittest.TestCase):
     no_dense = SimpleNamespace(**{**vars(config), "first_num_dense_layers": 0})
     validate_training_config(no_dense)
     self.assertEqual(_layer_groups(no_dense), (("moe_layers", 4),))
-    for field, value in (("te_moe_block", False), ("load_balance_loss_weight", 0.01),
-                         ("routed_bias_update_rate", 0.01),
-                         ("first_num_dense_layers", 4)):
+    for field, value in (
+        ("te_moe_block", False),
+        ("load_balance_loss_weight", 0.01),
+        ("routed_bias_update_rate", 0.01),
+        ("first_num_dense_layers", 4),
+    ):
       with self.subTest(field=field), self.assertRaises(ValueError):
         validate_training_config(SimpleNamespace(**{**vars(frozen_bias), field: value}))
-    llama = SimpleNamespace(**{**vars(config), "decoder_block": DecoderBlockType.LLAMA2,
-                               "num_experts": 1, "te_moe_block": False, "routed_bias": True})
+    llama = SimpleNamespace(
+        **{
+            **vars(config),
+            "decoder_block": DecoderBlockType.LLAMA2,
+            "num_experts": 1,
+            "te_moe_block": False,
+            "routed_bias": True,
+        }
+    )
     with self.assertRaisesRegex(ValueError, "routed_bias"):
       validate_training_config(llama)
 
@@ -459,18 +518,32 @@ class DenseTrainingNnxTest(unittest.TestCase):
         ("te_no_quant", "te_fp8_currentscaling"), ("te_no_quant", "te_mxfp8"), (False, True)
     ):
       with self.subTest(dense=dense, gmm=gmm, use_enum=use_enum):
-        validate_training_config(deepseek_config(
-            routed_bias=True,
-            quantization=Recipe(dense) if use_enum else dense,
-            te_gmm_quantization=Recipe(gmm) if use_enum else gmm,
-        ))
+        validate_training_config(
+            deepseek_config(
+                routed_bias=True,
+                quantization=Recipe(dense) if use_enum else dense,
+                te_gmm_quantization=Recipe(gmm) if use_enum else gmm,
+            )
+        )
 
   def test_quantization_allowlists_reject_unrequested_recipes(self):
     for field, unsupported in (
-        ("quantization", ("", "mxfp8", "te_fp8_current_scaling", "te_mxfp8",
-                          "te_fp8_delayedscaling", "te_nvfp4", "te_nvfp4_no_rht")),
-        ("te_gmm_quantization", ("", "mxfp8", "te_fp8_current_scaling", "te_fp8_currentscaling",
-                                 "te_fp8_delayedscaling", "te_nvfp4", "te_nvfp4_no_rht")),
+        (
+            "quantization",
+            ("", "mxfp8", "te_fp8_current_scaling", "te_mxfp8", "te_fp8_delayedscaling", "te_nvfp4", "te_nvfp4_no_rht"),
+        ),
+        (
+            "te_gmm_quantization",
+            (
+                "",
+                "mxfp8",
+                "te_fp8_current_scaling",
+                "te_fp8_currentscaling",
+                "te_fp8_delayedscaling",
+                "te_nvfp4",
+                "te_nvfp4_no_rht",
+            ),
+        ),
     ):
       for value in unsupported:
         with self.subTest(field=field, value=value), self.assertRaisesRegex(ValueError, "quantization"):
@@ -479,8 +552,9 @@ class DenseTrainingNnxTest(unittest.TestCase):
           validate_training_config(config)
     for recipe in ("", "te_no_quant", "te_fp8_currentscaling", "te_mxfp8", "te_fp8_delayedscaling", "te_nvfp4"):
       with self.subTest(llama_quantization=recipe):
-        config = deepseek_config(decoder_block=DecoderBlockType.LLAMA2, num_experts=1,
-                                 te_moe_block=False, quantization=recipe)
+        config = deepseek_config(
+            decoder_block=DecoderBlockType.LLAMA2, num_experts=1, te_moe_block=False, quantization=recipe
+        )
         if recipe in ("", "te_no_quant"):
           validate_training_config(config)
         else:

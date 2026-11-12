@@ -54,7 +54,9 @@ class LossFromLogitsTest(unittest.TestCase):
     for actual, reference in zip(result, expected):
       np.testing.assert_allclose(actual, reference)
     self.assertEqual(int(result[2]), 3)
-    actual_gradient = jax.grad(lambda logits: train.loss_from_logits(logits, self.data, self.config, None)[0])(self.logits)
+    actual_gradient = jax.grad(lambda logits: train.loss_from_logits(logits, self.data, self.config, None)[0])(
+        self.logits
+    )
     reference_gradient = jax.grad(lambda logits: self.reference(logits)[0])(self.logits)
     np.testing.assert_allclose(actual_gradient, reference_gradient)
     np.testing.assert_array_equal(actual_gradient[self.data["targets_segmentation"] == 0], 0)

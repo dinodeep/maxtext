@@ -134,8 +134,11 @@ def grouped_reference_loss(functions, params, boundary, states, data):
     for apply, group_params, state in zip(functions, params, states):
       for layer in range(jax.tree.leaves(group_params)[0].shape[0]):
         hidden, _ = apply(
-            jax.tree.map(lambda x: x[layer], group_params), hidden,
-            jax.tree.map(lambda x: x[layer], state), one["inputs_position"], one["inputs_segmentation"],
+            jax.tree.map(lambda x: x[layer], group_params),
+            hidden,
+            jax.tree.map(lambda x: x[layer], state),
+            one["inputs_position"],
+            one["inputs_segmentation"],
         )
     loss, aux = loss_apply(boundary, hidden, one)
     loss_sum += loss
@@ -144,6 +147,7 @@ def grouped_reference_loss(functions, params, boundary, states, data):
 
 
 class DenseTrainingScheduleTest(unittest.TestCase):
+
   def assert_tree_allclose(self, actual, expected):
     self.assertEqual(jax.tree.structure(actual), jax.tree.structure(expected))
     for actual_leaf, expected_leaf in zip(jax.tree.leaves(actual), jax.tree.leaves(expected)):
@@ -216,7 +220,9 @@ class DenseTrainingScheduleTest(unittest.TestCase):
         functions, args = make_grouped_inputs(lengths, microbatches)
         params, states, boundary, data = args
         reference = lambda p, b: grouped_reference_loss(functions, p, b, states, data)
-        (loss, aux), (layer_grads, boundary_grads) = jax.value_and_grad(reference, argnums=(0, 1), has_aux=True)(params, boundary)
+        (loss, aux), (layer_grads, boundary_grads) = jax.value_and_grad(reference, argnums=(0, 1), has_aux=True)(
+            params, boundary
+        )
         for schedule in ("serial", "dual_pipe"):
           with self.subTest(lengths=lengths, microbatches=microbatches, schedule=schedule):
             step = make_training_schedule(prefix_apply, functions, loss_apply, schedule)
@@ -228,7 +234,9 @@ class DenseTrainingScheduleTest(unittest.TestCase):
         functions, args = make_grouped_inputs(lengths, microbatches)
         params, states, boundary, data = args
         reference = lambda p, b: grouped_reference_loss(functions, p, b, states, data)
-        (loss, aux), (layer_grads, boundary_grads) = jax.value_and_grad(reference, argnums=(0, 1), has_aux=True)(params, boundary)
+        (loss, aux), (layer_grads, boundary_grads) = jax.value_and_grad(reference, argnums=(0, 1), has_aux=True)(
+            params, boundary
+        )
         rematted = tuple(jax.checkpoint(f, policy=jax.checkpoint_policies.nothing_saveable) for f in functions)
         with self.subTest(lengths=lengths, microbatches=microbatches):
           step = make_training_schedule(prefix_apply, rematted, loss_apply, "dual_pipe", checkpointed_layers=True)
@@ -371,13 +379,17 @@ class DenseTrainingScheduleTest(unittest.TestCase):
   @unittest.skipUnless(jax.default_backend() == "gpu", "host offload needs a GPU backend")
   def test_offloaded_residuals_stay_on_host(self):
     policy = jax.checkpoint_policies.save_and_offload_only_these_names(
-        names_which_can_be_saved=["query_proj"], names_which_can_be_offloaded=["mlpwi"],
-        offload_src="device", offload_dst="pinned_host",
+        names_which_can_be_saved=["query_proj"],
+        names_which_can_be_offloaded=["mlpwi"],
+        offload_src="device",
+        offload_dst="pinned_host",
     )
     functions, args = make_grouped_inputs((2, 3), 3)
     params, states, boundary, data = args
     reference = lambda p, b: grouped_reference_loss(functions, p, b, states, data)
-    (loss, aux), (layer_grads, boundary_grads) = jax.value_and_grad(reference, argnums=(0, 1), has_aux=True)(params, boundary)
+    (loss, aux), (layer_grads, boundary_grads) = jax.value_and_grad(reference, argnums=(0, 1), has_aux=True)(
+        params, boundary
+    )
     named = {layer_apply: named_layer_apply, expert_layer_apply: named_expert_layer_apply}
     rematted = tuple(jax.checkpoint(named[f], policy=policy) for f in functions)
     step = make_training_schedule(prefix_apply, rematted, loss_apply, "dual_pipe", checkpointed_layers=True)
@@ -390,7 +402,8 @@ class DenseTrainingScheduleTest(unittest.TestCase):
     functions, args = make_grouped_inputs((1, 3), 3)
     graph = jax.make_jaxpr(make_training_schedule(prefix_apply, functions, loss_apply))(*args)
     steady = [
-        eq for eq in graph.jaxpr.eqns
+        eq
+        for eq in graph.jaxpr.eqns
         if eq.primitive.name == "scan" and "steady_Bi_Fnext" in str(eq.source_info.name_stack)
     ]
     self.assertEqual(len(steady), 1)
@@ -418,10 +431,13 @@ class DenseTrainingScheduleTest(unittest.TestCase):
             "te_moe_max_total_recv_tokens": received,
             "te_moe_recv_capacity_per_rank": state["capacity"],
         }
+
       return jax.checkpoint(layer, policy=jax.checkpoint_policies.nothing_saveable)
 
     reference = lambda p, b: grouped_reference_loss(functions, p, b, states, data)
-    (loss, expected_aux), (layer_grads, boundary_grads) = jax.value_and_grad(reference, argnums=(0, 1), has_aux=True)(params, boundary)
+    (loss, expected_aux), (layer_grads, boundary_grads) = jax.value_and_grad(reference, argnums=(0, 1), has_aux=True)(
+        params, boundary
+    )
     expected_aux.update(
         te_moe_capacity_overflow=jnp.bool_(True),
         te_moe_max_total_recv_tokens=jnp.int32(25),
@@ -430,7 +446,10 @@ class DenseTrainingScheduleTest(unittest.TestCase):
     for schedule in ("serial", "dual_pipe"):
       with self.subTest(schedule=schedule):
         step = make_training_schedule(
-            prefix_apply, tuple(with_metrics(apply) for apply in functions), loss_apply, schedule,
+            prefix_apply,
+            tuple(with_metrics(apply) for apply in functions),
+            loss_apply,
+            schedule,
         )
         actual = jax.jit(step)(params, states, boundary, data)
         self.assert_tree_allclose(actual, (loss, expected_aux, layer_grads, boundary_grads))
@@ -442,20 +461,25 @@ class DenseTrainingScheduleTest(unittest.TestCase):
       jax.jit(step)(*args)
 
   def test_fixed_metric_reductions(self):
-    reduced = _reduce_aux({
-        "te_moe_capacity_overflow": jnp.array([False, True, False]),
-        "te_moe_max_total_recv_tokens": jnp.array([7, 13, 5]),
-        "te_moe_recv_capacity_per_rank": jnp.array([12, 16, 14]),
-        "total_loss": jnp.array([1.0, 2.0, 3.0]),
-        "total_weights": jnp.array([2, 4, 1]),
-    })
-    self.assert_tree_allclose(reduced, {
-        "te_moe_capacity_overflow": jnp.bool_(True),
-        "te_moe_max_total_recv_tokens": jnp.int32(13),
-        "te_moe_recv_capacity_per_rank": jnp.int32(12),
-        "total_loss": jnp.float32(6),
-        "total_weights": jnp.int32(7),
-    })
+    reduced = _reduce_aux(
+        {
+            "te_moe_capacity_overflow": jnp.array([False, True, False]),
+            "te_moe_max_total_recv_tokens": jnp.array([7, 13, 5]),
+            "te_moe_recv_capacity_per_rank": jnp.array([12, 16, 14]),
+            "total_loss": jnp.array([1.0, 2.0, 3.0]),
+            "total_weights": jnp.array([2, 4, 1]),
+        }
+    )
+    self.assert_tree_allclose(
+        reduced,
+        {
+            "te_moe_capacity_overflow": jnp.bool_(True),
+            "te_moe_max_total_recv_tokens": jnp.int32(13),
+            "te_moe_recv_capacity_per_rank": jnp.int32(12),
+            "total_loss": jnp.float32(6),
+            "total_weights": jnp.int32(7),
+        },
+    )
     self.assertEqual(reduced["te_moe_capacity_overflow"].dtype, jnp.bool_)
     self.assertEqual(_reduce_aux({}), {})
 
