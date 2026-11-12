@@ -38,6 +38,7 @@ from maxtext.experimental.dualpipe_nnx import (
     _make_layer_adapter,
     _microbatches,
     _restore_gradients,
+    _remat_enabled,
     _te_layer_metrics,
     validate_training_config,
 )
@@ -495,6 +496,11 @@ class DenseTrainingNnxTest(unittest.TestCase):
                 nnx.state(updated_model, nnx.Param), jax.tree.map(lambda p, g: p - 0.01 * g, all_params, expected_grads)
             )
             self.assert_tree_allclose(nnx.state(updated_model, nnx.Not(nnx.Param)), original_state)
+
+  def test_remat_none_disables_checkpointing(self):
+    # pyconfig turns remat_policy=none into None; neither may select the checkpointed path.
+    for policy, enabled in ((None, False), ("none", False), ("full", True), ("minimal", True)):
+      self.assertEqual(_remat_enabled(SimpleNamespace(remat_policy=policy)), enabled, policy)
 
   def test_deepseek_validation_and_group_layout(self):
     config = deepseek_config()

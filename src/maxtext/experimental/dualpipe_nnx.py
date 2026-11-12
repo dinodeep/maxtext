@@ -105,6 +105,11 @@ def validate_training_config(config):
     raise RuntimeError("dual_pipe requires a JAX build providing jax.fwd_and_bwd")
 
 
+def _remat_enabled(config):
+  """Whether decoder layers are checkpointed; pyconfig turns remat_policy=none into None."""
+  return bool(config.remat_policy) and config.remat_policy.lower() != "none"
+
+
 def _layer_groups(config):
   """Names and lengths of contiguous homogeneous stacks, in forward order."""
   if config.decoder_block == DecoderBlockType.DEEPSEEK:
@@ -178,7 +183,7 @@ def _make_layer_adapter(layers, config, layer_name, layer_count, remat_policy=No
       stats = _te_layer_metrics(nnx.pop(layer, nnx.Intermediate), required=layer_name == "moe_layers")
     return hidden, stats
 
-  if config.remat_policy != "none":
+  if _remat_enabled(config):
     # Same checkpointing as the regular decoder's scanned layers: any remat
     # policy (full, custom with device/offload/remat per tensor, presets). The
     # schedule keeps only the residuals this policy saves.
@@ -300,7 +305,7 @@ def dualpipe_loss_and_grad(config, model, params_shardings, data, loss_from_logi
       layer_apply,
       loss_apply,
       grad_dtype=config.grad_dtype,
-      checkpointed_layers=config.remat_policy != "none",
+      checkpointed_layers=_remat_enabled(config),
       constrain_residual=constrain_residual,
       layer_loop_context=(lambda: model_loop_unroll_context(config))
       if config.dual_pipe_double_buffer_layer_loops
