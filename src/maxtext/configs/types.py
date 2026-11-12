@@ -726,6 +726,16 @@ class Quantization(BaseModel):
           "'full' also overlaps attention QKV and output projections."
       ),
   )
+  te_precompute_weight_amax: bool = Field(
+      False,
+      description=(
+          "With quantization=te_fp8_currentscaling, compute each TE dense kernel's amax (max |W|) once per training "
+          "step, before gradient accumulation, and pass it to TE instead of computing it and all-reducing it across "
+          "FSDP in every GEMM call. Removes the per-call amax all-reduces from the layer loops, and reduces the amax "
+          "over every axis the kernel is sharded on, so all shards of a weight share one scale. Requires a "
+          "TransformerEngine whose jax.dense accepts kernel_amax."
+      ),
+  )
 
 
 class ModelArchitecture(BaseModel):
@@ -1403,15 +1413,6 @@ class MoEGeneral(BaseModel):
   te_moe_quantize_before_fsdp_all_gather: bool = Field(
       False,
       description="Quantize TE MoE weight shards before the FSDP all-gather; false quantizes after gathering.",
-  )
-  te_precompute_weight_amax: bool = Field(
-      False,
-      description=(
-          "With quantization=te_fp8_currentscaling, compute each TE dense kernel's amax (max |W|) once per training "
-          "step, before gradient accumulation, and pass it to TE instead of computing it and all-reducing it across "
-          "FSDP in every GEMM call. Removes the per-call amax all-reduces from the layer loops, and reduces the amax "
-          "over every axis the kernel is sharded on, so all shards of a weight share one scale."
-      ),
   )
   te_ep_overflow_check_every_n_steps: PositiveInt = Field(
       20,

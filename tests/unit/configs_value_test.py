@@ -202,6 +202,17 @@ class ConfigTest(absltest.TestCase):
           types.MaxTextConfig(**{**common_config, **overrides})
         self.assertIn(expected_error, str(context.exception))
 
+  def test_te_precompute_weight_amax_requires_te_fp8_currentscaling(self):
+    config = types.MaxTextConfig(run_name="test", quantization="te_fp8_currentscaling", te_precompute_weight_amax=True)
+    self.assertTrue(config.te_precompute_weight_amax)
+    for quantization in ("", "te_mxfp8", "fp8"):
+      with self.subTest(quantization=quantization):
+        with self.assertRaises(pydantic.ValidationError) as context:
+          types.MaxTextConfig(run_name="test", quantization=quantization, te_precompute_weight_amax=True)
+        self.assertIn(
+            "te_precompute_weight_amax=True requires quantization=te_fp8_currentscaling", str(context.exception)
+        )
+
   def test_te_moe_block_accepts_random_routing(self):
     config = types.MaxTextConfig(
         run_name="test",
