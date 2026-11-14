@@ -300,6 +300,10 @@ class DenseTrainingScheduleTest(unittest.TestCase):
       out, saved, _ = jax.jit(forward)(weights, hidden, state, positions, segments)
       with self.subTest(policy=name):
         self.assertEqual([x.shape for x in saved], expected[name])
+        # Relies on jax.vjp's pullback leaves keeping input identity: hidden is recognized as an input.
+        self.assertTrue(forward.layouts[-1].needs_hidden)
+        if name == "nothing":
+          self.assertEqual(sum(forward.layouts[-1].kept), 0)
         # Weights/state are re-read from the model at backward time, never saved.
         self.assertTrue(all(x.shape != weights["kernel"].shape for x in saved))
         dweights, dhidden = jax.jit(backward)(weights, state, positions, segments, saved, jnp.ones_like(out))

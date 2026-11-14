@@ -103,26 +103,51 @@ def _checkpointed_layer_passes(apply):
   backward(weights, state, positions, segments, saved, dy) -> (dweights, dhidden)
   rebuilds the pullback from saved plus the model's weights/state. The layout
   is recorded when forward is traced and must be identical for every trace.
+
+  How it works: jax.vjp returns the pullback as a pytree. Its treedef holds the
+  backward jaxpr (for a checkpointed layer, the recompute of whatever the policy
+  did not save, then the transposed ops), and its leaves are every array that
+  jaxpr reads. A leaf is either one of the layer's own inputs or a saved
+  activation. forward flattens the pullback and tells the two apart by object
+  identity. It keeps only the saved activations that the backward actually reads
+  (see _used_pullback_leaves), plus the hidden input when it is read, since hidden
+  differs per microbatch. Weights, state, positions and segments are never stored.
+  backward puts the leaf list back together in its original order: inputs from
+  its arguments, activations from saved, and zeros for leaves that are never read
+  (XLA removes them). It then unflattens with the recorded treedef and calls the
+  result on dy, which runs the layer's recompute and backward. This is not
+  jax.fwd_and_bwd, because its residuals would include the layer's weights, so
+  every pool slot would hold a copy of them.
+
+  backward always uses the first trace's treedef. The layout check compares the
+  stored residuals, not the backward jaxpr, so every trace must produce the same
+  backward computation. This relies on how jax.vjp flattens its pullback.
   """
   layouts = []
 
   def inputs_of(weights, hidden, state, positions, segments):
+    # Fixed flattening order; a pullback leaf's "source" is its index in this list.
     return jax.tree.leaves((weights, hidden, state, positions, segments))
 
   def forward(weights, hidden, state, positions, segments):
+    # Only weights and hidden are differentiated; state, positions and segments are closed-over constants.
     out, pullback, metrics = jax.vjp(lambda w, x: apply(w, x, state, positions, segments), weights, hidden, has_aux=True)
     leaves, treedef = jax.tree.flatten(pullback)
+    # A leaf that is the same object as an input is re-supplied at backward time; None marks a saved activation.
     index = {id(x): i for i, x in enumerate(inputs_of(weights, hidden, state, positions, segments))}
     sources = tuple(index.get(id(leaf)) for leaf in leaves)
     used = _used_pullback_leaves(treedef, leaves, out)
     kept = tuple(source is None and u for source, u in zip(sources, used))
     saved = tuple(leaf for leaf, k in zip(leaves, kept) if k)
+    # hidden directly follows the weight leaves in inputs_of and is a single array.
     hidden_index = len(jax.tree.leaves(weights))
     needs_hidden = any(source == hidden_index and u for source, u in zip(sources, used))
     if needs_hidden:
       saved = (hidden,) + saved
     leaf_avals = tuple((tuple(x.shape), x.dtype) for x in leaves)
+    # saved_avals (shape, dtype, memory space) is also the key that groups layers into residual pools.
     layout = _ResidualLayout(treedef, sources, tuple(_aval_key(x) for x in saved), kept, leaf_avals, needs_hidden)
+    # treedef is not compared: it holds a jaxpr object that is new on every trace.
     if layouts and not layouts[0].matches(layout):
       raise ValueError("A layer's saved-residual layout changed between traces")
     layouts.append(layout)
@@ -145,6 +170,7 @@ def _checkpointed_layer_passes(apply):
       else:
         # Never read by the backward, so XLA drops this placeholder.
         leaves.append(jnp.zeros(shape, dtype))
+    # Calling the rebuilt pullback runs the recompute and backward; returns (dweights, dhidden).
     return jax.tree.unflatten(layout.treedef, leaves)(dy)
 
   forward.layouts = layouts
