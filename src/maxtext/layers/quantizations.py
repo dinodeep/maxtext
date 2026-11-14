@@ -15,6 +15,7 @@
 """Quantization library."""
 
 import functools
+import inspect
 import json
 import math
 import qwix.pallas as qpl
@@ -70,6 +71,7 @@ from maxtext.configs.types import JAX_MX_QUANTIZATIONS, TeCommGemmOverlapPolicy
 from maxtext.common.common_types import Array, DType, Config, is_fp8_dtype, get_weight_dtype
 from maxtext.inference.kvcache import KVQuant
 from maxtext.utils import max_logging
+from maxtext.utils import max_utils
 
 # Params used to define mixed precision quantization configs
 DEFAULT = "__default__"  # default config
@@ -1789,6 +1791,9 @@ def refresh_te_kernel_amaxes(model: nnx.Module) -> int:
   is a local max plus one all-reduce over every axis the kernel is sharded on, so all shards of a weight share
   one scale. A stacked (scanned) amax has one entry per layer; its kernel's layer axis is the `param_scan_axis`
   recorded in the kernel's metadata.
+
+  With `parameter_memory_host_offload`, kernels live in host memory; they are moved to device before the reduction,
+  one layer at a time for a stacked kernel (as the layer scan does), so the whole stack is never on device at once.
   """
   count = 0
   for _, node in nnx.iter_graph(model):
@@ -1798,7 +1803,10 @@ def refresh_te_kernel_amaxes(model: nnx.Module) -> int:
     kernel_var = node.kernel
     kernel = kernel_var.get_value()
     amax = amax_var.get_value()
+    on_host = getattr(node, "parameter_memory_host_offload", False)
     if amax.shape == (1,):
+      if on_host:
+        kernel = jax.device_put(kernel, max_utils.device_space())
       new = kernel_amax_like(kernel, node.dtype).reshape(1)
     elif amax.ndim == 2 and amax.shape[1] == 1:
       layer_axis = kernel_var.get_metadata().get("param_scan_axis", 0)
@@ -1806,7 +1814,17 @@ def refresh_te_kernel_amaxes(model: nnx.Module) -> int:
         raise ValueError(
             f"TEKernelAmax of shape {amax.shape} does not match kernel {kernel.shape} on layer axis {layer_axis}."
         )
-      new = kernel_amax_like(kernel, node.dtype, layer_axis).reshape(amax.shape)
+      if on_host:
+        if layer_axis != 0:
+          raise ValueError(f"parameter_memory_host_offload requires param_scan_axis=0, got {layer_axis}.")
+        new = jax.lax.map(
+            lambda layer_kernel, dtype=node.dtype: kernel_amax_like(
+                jax.device_put(layer_kernel, max_utils.device_space()), dtype
+            ),
+            kernel,
+        ).reshape(amax.shape)
+      else:
+        new = kernel_amax_like(kernel, node.dtype, layer_axis).reshape(amax.shape)
     else:
       raise NotImplementedError(
           f"te_precompute_weight_amax supports at most one level of layer stacking (amax shape {amax.shape})."
@@ -1814,6 +1832,17 @@ def refresh_te_kernel_amaxes(model: nnx.Module) -> int:
     amax_var.set_value(jax.lax.stop_gradient(new.astype(jnp.float32)))
     count += 1
   return count
+
+
+def _check_te_dense_accepts_kernel_amax():
+  """Raises unless the installed TransformerEngine's `transformer_engine.jax.dense.dense` takes `kernel_amax`."""
+  import transformer_engine.jax.dense as te_dense  # pylint: disable=import-outside-toplevel # pytype: disable=import-error
+
+  if "kernel_amax" not in inspect.signature(te_dense.dense).parameters:
+    raise ValueError(
+        "te_precompute_weight_amax=True requires a TransformerEngine whose transformer_engine.jax.dense.dense "
+        "accepts kernel_amax. Upgrade TransformerEngine or set te_precompute_weight_amax=False."
+    )
 
 
 class TransformerEngineQuantization(Quantization):
@@ -1833,6 +1862,8 @@ class TransformerEngineQuantization(Quantization):
 
     # Dense layers keep a TEKernelAmax refreshed once per step (refresh_te_kernel_amaxes) and pass it to TE.
     self.precompute_weight_amax = bool(getattr(config, "te_precompute_weight_amax", False))
+    if self.precompute_weight_amax:
+      _check_te_dense_accepts_kernel_amax()
 
   def __hash__(self):
     return hash((self.quant_mode, self._recipe, self.precompute_weight_amax))
