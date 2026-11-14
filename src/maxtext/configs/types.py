@@ -732,8 +732,10 @@ class Quantization(BaseModel):
           "With quantization=te_fp8_currentscaling, compute each TE dense kernel's amax (max |W|) once per training "
           "step, before gradient accumulation, and pass it to TE instead of computing it and all-reducing it across "
           "FSDP in every GEMM call. Removes the per-call amax all-reduces from the layer loops, and reduces the amax "
-          "over every axis the kernel is sharded on, so all shards of a weight share one scale. Requires a "
-          "TransformerEngine whose jax.dense accepts kernel_amax."
+          "over every axis the kernel is sharded on, so all shards of a weight share one scale. TE's per-call amax "
+          "is reduced across FSDP only, so with a tensor-parallel-sharded kernel the scales (and results) differ "
+          "slightly from the flag-off path; both are valid current scaling. Requires a TransformerEngine whose "
+          "jax.dense accepts kernel_amax."
       ),
   )
 

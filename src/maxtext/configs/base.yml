@@ -213,7 +213,8 @@ weight_sparsity_start_step: 50
 # and "full" means to overlap MLP projections as well as the QKV and output projection layers in attention.
 te_comm_gemm_overlap: "disabled"
 # With quantization=te_fp8_currentscaling, compute each TE dense kernel's amax once per training step instead of
-# in (and all-reducing it across FSDP for) every GEMM call.
+# in (and all-reducing it across FSDP for) every GEMM call. The amax covers the whole kernel, so with a
+# tensor-parallel-sharded kernel results differ slightly from the default (per-TP-shard) amax.
 te_precompute_weight_amax: false
 
 decoder_block: "llama2" # which style of decoderblock to use.
