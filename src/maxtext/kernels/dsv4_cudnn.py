@@ -22,6 +22,11 @@ import jax.numpy as jnp
 # as a batch partition inside TE's shard_map, including MoE EP and FSDP.
 _CSA_BATCH_AXES = ("data", "fsdp", "expert")
 
+# DSV4_FAST_BWD=1 swaps the cuDNN frontend DSA backward for a persistent SM100 kernel (see dsv4_dsa_bwd_fast).
+from maxtext.kernels import dsv4_dsa_bwd_fast  # pylint: disable=wrong-import-position
+
+dsv4_dsa_bwd_fast.install_if_enabled()
+
 
 def compress_ratio4(kv: Any, gate: Any, position_bias: Any) -> Any:
   """Runs the differentiable ratio-4 overlap compressor, before RMSNorm/RoPE."""
