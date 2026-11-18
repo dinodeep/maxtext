@@ -12,6 +12,7 @@ MaxText configurations do not require an SM100-capable stack.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import jax
@@ -166,6 +167,12 @@ def indexer_sparse_kl_loss_ratio4(indexer_inputs: dict[str, Any], target_selecte
   return jnp.sum(shard_sums)
 
 
+# Compact CSA index layout for the DSA kernel when the TE indexer top-k is used: [128-key window | indexer
+# selection in the indexer's own order] with indexer_topk=0 and topk_length = window + valid selections, so the
+# kernel skips all-invalid 64-key tiles and no index sort is needed. DSV4_CSA_COMPACT=0 restores the sorted layout.
+_CSA_COMPACT = os.environ.get("DSV4_CSA_COMPACT", "1") == "1"
+
+
 def sparse_attention_ratio4(
     q: Any,
     local_kv: Any,
@@ -196,6 +203,37 @@ def sparse_attention_ratio4(
   valid = mask > -1.0e20
   if topk_indices is None:
     selected, selected_valid = _first_valid_blocks(valid, indexer_topk)
+  elif _CSA_COMPACT:
+    # Compact layout: [128 window | indexer selection in the indexer's own order], indexer_topk=0, and
+    # topk_length = window + (last valid selection slot + 1). The TE top-k lists valid blocks first (rows with
+    # <= top_k causally valid blocks are 0..n-1 then -1), so the kernel skips every all-invalid 64-key tile
+    # (~2048 of 4096 queries have < 512 valid blocks) and no sort of the indices is needed. Same math as the
+    # sorted layout below; only the kernel's accumulation order changes (bf16-ulp-level differences).
+    selected = topk_indices.astype(jnp.int32)
+    selected_valid = (selected >= 0) & jnp.take_along_axis(valid, jnp.maximum(selected, 0), axis=-1)
+    selected_valid = selected_valid & (selected < comp_len)
+    comp_idx = jnp.where(selected_valid, q_len + selected, -1)
+    pad = indexer_topk - comp_idx.shape[-1]
+    if pad > 0:
+      comp_idx = jnp.pad(comp_idx, ((0, 0), (0, 0), (0, pad)), constant_values=-1)
+    slot = jnp.arange(1, comp_idx.shape[-1] + 1, dtype=jnp.int32)
+    n_used = jnp.max(jnp.where(comp_idx >= 0, slot, 0), axis=-1)
+    query_pos = jnp.arange(q_len, dtype=jnp.int32)[None, :, None]
+    local_pos = query_pos + jnp.arange(1 - window_size, 1, dtype=jnp.int32)[None, None, :]
+    local_indices = jnp.broadcast_to(jnp.where(local_pos >= 0, local_pos, -1), (batch, q_len, window_size))
+    indices = jnp.concatenate([local_indices, comp_idx], axis=-1)
+    lengths = (window_size + n_used).astype(jnp.int32)
+    kv = jnp.concatenate([local_kv, compressed_kv], axis=1)[:, :, 0, :]
+    return dsa_sparse_attention_batched(
+        q.astype(jnp.bfloat16),
+        kv.astype(jnp.bfloat16),
+        indices,
+        lengths,
+        sinks.astype(jnp.float32),
+        batch_axes=_CSA_BATCH_AXES,
+        indexer_topk=0,
+        softmax_scale=1.0,
+    )
   else:
     selected = topk_indices.astype(jnp.int32)
     selected_valid = (selected >= 0) & jnp.take_along_axis(valid, jnp.maximum(selected, 0), axis=-1)
