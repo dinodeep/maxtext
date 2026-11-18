@@ -2189,6 +2189,27 @@ class CompressedAttention(Attention):
 
       init_probs = jnp.zeros((batch, q_len, compressed_len), dtype=jnp.float32)
       target_probs, _ = jax.lax.scan(scan_body_heads, init_probs, {"q": q_h})
+    elif getattr(self.config, "dsv4_teacher_two_pass", False):
+      # Two-pass teacher in [b, t, h, w] layout without any 4-D f32 intermediate and without 4-D scalar-constant
+      # broadcasts. In the scanned layer loop XLA hoists 4-D broadcasts of jnp.where scalar constants out of the
+      # loop and materializes them (2 x 7.5 GB f32 at B=7, T=4096, H=64, W=1024), and a one-pass softmax writes the
+      # f32 probabilities (7.5 GB) only to sum them over heads. Here: pass 1 = per-(b, t, h) max and sum-exp over W,
+      # pass 2 = sum over heads of exp(x - m) / l, recomputed from the bf16 scores. The mask is a loop-variant
+      # [b, t, 1, w] f32 bias (masked logits -> DEFAULT_MASK_VALUE + s, exp -> 0). Rows with no valid block get a
+      # finite (uniform) softmax and are zeroed below by valid_tokens_mask, so no extra NaN shield is needed.
+      bias = jnp.where(is_invalid_block, DEFAULT_MASK_VALUE, 0.0).astype(jnp.float32)[:, :, None, :]
+      # The barrier keeps XLA from turning the bias add into a cuBLAS beta*C operand (materialized broadcast).
+      scores = jax.lax.optimization_barrier(
+          jnp.einsum("bthd, bwd -> bthw", query, k_vec, precision=self.config.matmul_precision)
+      )
+      x = scores.astype(jnp.float32) + bias
+      row_max = jnp.max(x, axis=-1, keepdims=True)
+      inv_row_sum = 1.0 / jnp.sum(jnp.exp(x - row_max), axis=-1, keepdims=True)
+      # Pass 2 must re-read the bf16 scores rather than a materialized f32 exp(x - m).
+      scores, row_max, inv_row_sum = jax.lax.optimization_barrier((scores, row_max, inv_row_sum))
+      x = scores.astype(jnp.float32) + bias
+      target_probs = jnp.sum(jnp.exp(x - row_max) * inv_row_sum, axis=2)
+      target_probs = jax.lax.optimization_barrier(target_probs)
     else:
       attention_scores = jnp.einsum("bthd, bwd -> bhtw", query, k_vec, precision=self.config.matmul_precision)
       attention_scores = attention_scores + c_mask

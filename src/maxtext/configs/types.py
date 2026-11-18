@@ -953,6 +953,14 @@ class Attention(BaseModel):
           "Default is 0 (no chunking). Reduces memory footprint at the cost of time."
       ),
   )
+  dsv4_teacher_two_pass: bool = Field(
+      False,
+      description=(
+          "DeepSeek-V4 CSA indexer loss (unchunked teacher): two-pass [b,t,h,w] teacher (row max / sum-exp, then "
+          "head-summed probabilities recomputed from the bf16 scores) with a loop-variant additive mask; avoids the "
+          "4-D f32 probability tensor and hoisted 4-D constant broadcasts."
+      ),
+  )
 
 
 class MoBa(BaseModel):
