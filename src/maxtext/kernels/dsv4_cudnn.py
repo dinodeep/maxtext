@@ -17,6 +17,11 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 
+from maxtext.kernels import dsv4_dsa_fwd_fast
+
+# DSV4_FAST_FWD=1 swaps the cuDNN frontend DSA forward for a persistent SM100 kernel (see dsv4_dsa_fwd_fast).
+dsv4_dsa_fwd_fast.install_if_enabled()
+
 
 # CSA is independent between sequences.  Treat every outer data-parallel axis
 # as a batch partition inside TE's shard_map, including MoE EP and FSDP.
