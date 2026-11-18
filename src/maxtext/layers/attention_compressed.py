@@ -49,6 +49,7 @@ from maxtext.layers.quantizations import AqtQuantization as Quant
 from maxtext.inference.kvcache import KVQuant
 from maxtext.inference import kvcache
 from maxtext.utils.globals import EPS
+from maxtext.kernels import dsv4_qo_fused
 from maxtext.kernels.attention import csa_streamindex
 
 
@@ -1731,6 +1732,16 @@ class CompressedAttention(Attention):
     # [batch, seq_len, q_lora_rank] -> [batch, seq_len, num_query_heads, head_dim]
     q_up = self.wq_b(q_normed)
 
+    if (
+        getattr(self.config, "dsv4_fused_q", False)
+        and model_mode == MODEL_MODE_TRAIN
+        and isinstance(self.rotary_embedding, DeepSeekV4RotaryEmbedding)
+    ):
+      # One fused pass (and one in the backward) for RMSNorm + RoPE + scale; same math as below.
+      cos, sin = self.rotary_embedding.get_freqs(inputs_positions)
+      q_out = dsv4_qo_fused.q_norm_rope_scale(q_up, cos, sin, self.q_up_norm.epsilon, self.softmax_scale)
+      return q_out, q_normed
+
     q_up_normed = self.q_up_norm(q_up)
 
     # -> [batch, seq_len, num_query_heads, head_dim]
@@ -2009,17 +2020,34 @@ class CompressedAttention(Attention):
         compress_ratio=self.compress_ratio,
     )
 
-    # Reverse RoPE on Values
-    attn_out = self._apply_rotary_embedding_v4(attn_out, inputs_positions, unsqueeze_dim=-2, reverse=True)
-
-    attn_out = checkpoint_name(attn_out, "attention_out")
-
-    # Project outputs through Grouped Linear layers
     b, s, h, d = attn_out.shape
-    # -> [batch, q_length, o_groups, in_features_per_group]
-    grouped_out = attn_out.reshape(b, s, self.config.o_groups, (h * d) // self.config.o_groups)
-    # -> [batch, q_length, o_groups, out_features_per_group]
-    grouped_out = self.o_a_proj(grouped_out)
+    if (
+        getattr(self.config, "dsv4_fused_o_bwd", False)
+        and model_mode == MODEL_MODE_TRAIN
+        and isinstance(self.rotary_embedding, DeepSeekV4RotaryEmbedding)
+        and not self.o_a_proj.parameter_memory_host_offload
+    ):
+      # Reverse RoPE + grouped projection with a fused backward (the "attention_out" residual is the rotated
+      # output kept by the custom VJP; with attention_out=remat this matches the stock policy).
+      cos, sin = self.rotary_embedding.get_freqs(inputs_positions)
+      grouped_out = dsv4_qo_fused.inv_rope_grouped_proj(
+          attn_out,
+          cos,
+          sin,
+          self.o_a_proj.kernel[...],
+          jax.lax.Precision(self.o_a_proj.matmul_precision),
+      ).astype(self.o_a_proj.dtype)
+    else:
+      # Reverse RoPE on Values
+      attn_out = self._apply_rotary_embedding_v4(attn_out, inputs_positions, unsqueeze_dim=-2, reverse=True)
+
+      attn_out = checkpoint_name(attn_out, "attention_out")
+
+      # Project outputs through Grouped Linear layers
+      # -> [batch, q_length, o_groups, in_features_per_group]
+      grouped_out = attn_out.reshape(b, s, self.config.o_groups, (h * d) // self.config.o_groups)
+      # -> [batch, q_length, o_groups, out_features_per_group]
+      grouped_out = self.o_a_proj(grouped_out)
     # -> [batch, q_length, o_groups * out_features_per_group]
     grouped_flat = grouped_out.reshape(b, s, -1)
     # -> [batch, q_length, emb_dim]

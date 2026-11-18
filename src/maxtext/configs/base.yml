@@ -707,6 +707,8 @@ compress_ratios: [] # Per-layer compression ratios (0, 4, 128, etc).
 compressed_rope_max_timescale: 160_000 # If positive, used for Compressed Sparse/Heavy Attention.
 use_csa_streamindex_kernel: false # Whether to use Pallas TPU kernel for CSA StreamIndex score computation.
 use_csa_vmap_selection_mask: false # Build the CSA top-k selection mask with a vmapped scatter instead of a broadcast-compare (slower on TPU, where XLA fuses the compare).
+dsv4_fused_q: false # Fused Triton kernel for the DSv4 query RMSNorm + RoPE + scale (fwd and bwd).
+dsv4_fused_o_bwd: false # Fused Triton kernel for the DSv4 output-path backward (grouped o-proj dgrad layout + inverse-RoPE transpose).
 
 # QK-Clip (Muon Clip) Configuration
 use_qk_clip: false  # Enable QK-Clip (supported in MLA with DotProduct or Tokamax Splash)

@@ -1011,6 +1011,20 @@ class CompressedAttention(BaseModel):
           "a [batch, seq, k, compressed_len] broadcast-compare. Slower on TPU, where XLA fuses the compare."
       ),
   )
+  dsv4_fused_q: bool = Field(
+      False,
+      description=(
+          "DeepSeek-V4 compressed attention: run the per-head query RMSNorm + partial RoPE + softmax scale as one "
+          "fused Triton kernel (and one fused kernel in the backward) instead of separate XLA passes."
+      ),
+  )
+  dsv4_fused_o_bwd: bool = Field(
+      False,
+      description=(
+          "DeepSeek-V4 compressed attention: compute the grouped output projection's input gradient in its natural "
+          "layout and apply the transposed inverse RoPE in one fused Triton kernel."
+      ),
+  )
 
 
 class AttentionIndexer(BaseModel):
