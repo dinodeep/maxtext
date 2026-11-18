@@ -709,6 +709,8 @@ use_csa_streamindex_kernel: false # Whether to use Pallas TPU kernel for CSA Str
 use_csa_vmap_selection_mask: false # Build the CSA top-k selection mask with a vmapped scatter instead of a broadcast-compare (slower on TPU, where XLA fuses the compare).
 dsv4_fused_q: false # Fused Triton kernel for the DSv4 query RMSNorm + RoPE + scale (fwd and bwd).
 dsv4_fused_o_bwd: false # Fused Triton kernel for the DSv4 output-path backward (grouped o-proj dgrad layout + inverse-RoPE transpose).
+dsv4_o_a_proj_mxfp8: false # Run the DSv4 grouped o-projection (o_a_proj) in MXFP8 through TransformerEngine (needs quantization=te_mxfp8).
+dsv4_o_a_proj_mxfp8_impl: 'fused' # 'fused': Triton inv-RoPE+MXFP8 quantize kernels + TE grouped GEMMs (needs dsv4_fused_o_bwd); 'grouped': TE grouped_dense on the group-major input; 'loop': one TE dense per group.
 
 # QK-Clip (Muon Clip) Configuration
 use_qk_clip: false  # Enable QK-Clip (supported in MLA with DotProduct or Tokamax Splash)

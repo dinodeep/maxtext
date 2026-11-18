@@ -869,6 +869,8 @@ class DeepSeekV4GroupedLinear(nnx.Module):
       kernel_axes: tuple[None | str, ...] = ("groups", "embed", "mlp"),
       matmul_precision: str = "default",
       parameter_memory_host_offload: bool = False,
+      quant: None | Quant = None,
+      mxfp8_impl: None | str = None,
       *,
       rngs: nnx.Rngs,
   ):
@@ -884,8 +886,15 @@ class DeepSeekV4GroupedLinear(nnx.Module):
       kernel_axes: logical axes for partitioning the kernel.
       matmul_precision: Precision for matrix multiplication.
       parameter_memory_host_offload: Determines whether to offload params to host
+      quant: quantization config (only TransformerEngine MXFP8 is used, and only when mxfp8_impl is set).
+      mxfp8_impl: None (BF16 einsum), "grouped" (one TE MXFP8 grouped GEMM) or "loop" (one TE MXFP8 dense per group);
+        "fused" only differs from "grouped" in the dsv4_fused_o_bwd path of CompressedAttention (fused Triton quantize).
       rngs: RNG state for initialization in nnx.
     """
+    if mxfp8_impl not in (None, "grouped", "loop", "fused"):
+      raise ValueError(f"mxfp8_impl must be None, 'grouped', 'loop' or 'fused', got {mxfp8_impl!r}")
+    self.quant = quant
+    self.mxfp8_impl = mxfp8_impl
     if out_features % n_groups != 0:
       raise ValueError(f"out_features ({out_features}) must be divisible by n_groups ({n_groups})")
 
@@ -952,6 +961,14 @@ class DeepSeekV4GroupedLinear(nnx.Module):
     # Input shape:  [..., g, i]
     # Kernel shape: [g, i, o]
     # Output shape: [..., g, o]
+    if self.mxfp8_impl is not None:
+      from maxtext.kernels import dsv4_o_mxfp8  # pylint: disable=import-outside-toplevel
+
+      if self.mxfp8_impl == "loop":
+        return dsv4_o_mxfp8.grouped_linear_mxfp8_loop(inputs, kernel)
+      # "grouped" and "fused" (the fused kernel needs the inverse RoPE input, see CompressedAttention)
+      return dsv4_o_mxfp8.grouped_linear_mxfp8(inputs, kernel)
+
     output = jnp.einsum("...gi,gio->...go", inputs, kernel, precision=lax.Precision(self.matmul_precision))
 
     return output

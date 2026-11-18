@@ -50,6 +50,7 @@ from maxtext.inference.kvcache import KVQuant
 from maxtext.inference import kvcache
 from maxtext.utils.globals import EPS
 from maxtext.kernels import dsv4_qo_fused
+from maxtext.kernels import dsv4_o_mxfp8
 from maxtext.kernels.attention import csa_streamindex
 
 
@@ -1624,6 +1625,8 @@ class CompressedAttention(Attention):
         dtype=self.dtype,
         weight_dtype=self.weight_dtype,
         matmul_precision=self.config.matmul_precision,
+        quant=self.quant,
+        mxfp8_impl=self._o_a_proj_mxfp8_impl(),
         rngs=self.rngs,
     )
 
@@ -2030,13 +2033,24 @@ class CompressedAttention(Attention):
       # Reverse RoPE + grouped projection with a fused backward (the "attention_out" residual is the rotated
       # output kept by the custom VJP; with attention_out=remat this matches the stock policy).
       cos, sin = self.rotary_embedding.get_freqs(inputs_positions)
-      grouped_out = dsv4_qo_fused.inv_rope_grouped_proj(
-          attn_out,
-          cos,
-          sin,
-          self.o_a_proj.kernel[...],
-          jax.lax.Precision(self.o_a_proj.matmul_precision),
-      ).astype(self.o_a_proj.dtype)
+      if self.o_a_proj.mxfp8_impl == "fused":
+        # Triton inv-RoPE + MXFP8 quantize straight into TE's group-major operands, TE grouped GEMMs, fused bwd.
+        grouped_out = dsv4_o_mxfp8.inv_rope_grouped_proj_mxfp8_fused(
+            attn_out.astype(self.o_a_proj.dtype), cos, sin, self.o_a_proj.kernel[...]
+        ).astype(self.o_a_proj.dtype)
+      elif self.o_a_proj.mxfp8_impl == "grouped":
+        # MXFP8 grouped GEMM (fwd / dgrad / wgrad); its dgrad is group-major and feeds the fused o-backward kernel.
+        grouped_out = dsv4_o_mxfp8.inv_rope_grouped_proj_mxfp8(
+            attn_out.astype(self.o_a_proj.dtype), cos, sin, self.o_a_proj.kernel[...]
+        ).astype(self.o_a_proj.dtype)
+      else:
+        grouped_out = dsv4_qo_fused.inv_rope_grouped_proj(
+            attn_out,
+            cos,
+            sin,
+            self.o_a_proj.kernel[...],
+            jax.lax.Precision(self.o_a_proj.matmul_precision),
+        ).astype(self.o_a_proj.dtype)
     else:
       # Reverse RoPE on Values
       attn_out = self._apply_rotary_embedding_v4(attn_out, inputs_positions, unsqueeze_dim=-2, reverse=True)
@@ -2056,6 +2070,14 @@ class CompressedAttention(Attention):
 
     # Return the Tuple expected by the transformer block
     return final_out, current_kv_cache
+
+  def _o_a_proj_mxfp8_impl(self):
+    """MXFP8 implementation for o_a_proj (None = BF16 einsum); see `dsv4_o_a_proj_mxfp8`."""
+    if not getattr(self.config, "dsv4_o_a_proj_mxfp8", False):
+      return None
+    if self.config.quantization != "te_mxfp8":
+      raise ValueError("dsv4_o_a_proj_mxfp8 needs quantization=te_mxfp8")
+    return getattr(self.config, "dsv4_o_a_proj_mxfp8_impl", "grouped")
 
   def get_compressed_mask(
       self,

@@ -1025,6 +1025,21 @@ class CompressedAttention(BaseModel):
           "layout and apply the transposed inverse RoPE in one fused Triton kernel."
       ),
   )
+  dsv4_o_a_proj_mxfp8: bool = Field(
+      False,
+      description=(
+          "DeepSeek-V4 compressed attention: run the grouped output projection o_a_proj (fwd, dgrad, wgrad) in MXFP8 "
+          "through TransformerEngine. Needs quantization=te_mxfp8; combines with dsv4_fused_o_bwd."
+      ),
+  )
+  dsv4_o_a_proj_mxfp8_impl: str = Field(
+      "fused",
+      description=(
+          "'fused': Triton kernels quantize (inverse RoPE + transpose + MXFP8) straight into TE's group-major operands "
+          "and TE grouped GEMMs run fwd / dgrad / wgrad (only with dsv4_fused_o_bwd; otherwise same as 'grouped'); "
+          "'grouped': TE grouped_dense on the transposed input; 'loop': one TE MXFP8 dense per group."
+      ),
+  )
 
 
 class AttentionIndexer(BaseModel):
