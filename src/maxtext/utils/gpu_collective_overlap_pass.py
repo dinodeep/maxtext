@@ -36,6 +36,9 @@ Steps:
      Each iteration ends with schedule.update()/verify().
   3. Finally, hoist host-offload copy starts to their earliest legal position.
 
+An async call whose wrapped root is not the profiled op (te_ep_prepare's tuple
+root) is keyed by the custom-call it runs, so its window has a latency.
+
 Call ``register()`` once before the first ``jax.jit``-compiled function runs.
 """
 
@@ -547,9 +550,17 @@ _SM_GATE_MIN_US = float(os.environ.get("COLLECTIVE_OVERLAP_SM_GATE_MIN_US", "100
 _GUARD_DONE_CONSUMERS = os.environ.get("COLLECTIVE_OVERLAP_GUARD_DONE_CONSUMERS", "1") != "0"
 
 
+# _opcode_str results by opcode enum name ("kGetTupleElement"): a fixed mapping.
+_opcode_str_cache: dict[str, str] = {}
+
+
 def _opcode_str(inst) -> str:
   """Hyphenated opcode string (e.g. "get-tuple-element") for an HloInstruction."""
-  return re.sub(r"(?<!^)(?=[A-Z])", "-", inst.opcode.name[1:]).lower()
+  name = inst.opcode.name
+  s = _opcode_str_cache.get(name)
+  if s is None:
+    s = _opcode_str_cache[name] = re.sub(r"(?<!^)(?=[A-Z])", "-", name[1:]).lower()
+  return s
 
 
 # Host-offload copies: XLA lowers a remat offload to a pair of async DMAs,
@@ -613,6 +624,7 @@ def _register_host_offload_copies(module) -> None:
         names.update(user.name for user in inst.users())
   _host_offload_copy_names.clear()
   _host_offload_copy_names.update(names)
+  _inst_cost_cache.clear()
   if names:
     _logger.info(
         "gpu_collective_overlap_pass [%s]: registered %d host-offload copy instruction(s) (starts and dones): %s",
@@ -843,9 +855,82 @@ def _resolve_profile_key(async_start, comp_by_name: dict) -> str:
       comp = comp_by_name.get(m.group(1))
       if comp is not None:
         root = _computation_root(comp)
-  if root is None:
-    return async_start.name
-  return _unwrap_to_leaf_name(root, comp_by_name)
+  key = async_start.name if root is None else _unwrap_to_leaf_name(root, comp_by_name)
+  if key in _profile_costs:
+    return key
+  # The wrapped computation's root is not the profiled op: a te_ep_prepare
+  # call-start's root is a tuple of get-tuple-elements of the custom-call.
+  # The walk is cached: this runs millions of times per module.
+  wrapped = _wrapped_custom_call_cache.get(async_start.name, _NOT_CACHED)
+  if wrapped is _NOT_CACHED:
+    wrapped = _wrapped_custom_call_name(async_start, comp_by_name)
+    _wrapped_custom_call_cache[async_start.name] = wrapped
+  return wrapped or key
+
+
+# _wrapped_custom_call_name results by async start name, for the module being
+# processed (_select_module_profile clears it after applying the module's
+# profile): the result depends only on the module's structure and its costs.
+_wrapped_custom_call_cache: dict[str, Optional[str]] = {}
+_NOT_CACHED = object()
+
+
+def _select_module_profile(serialized_hlo: bytes) -> None:
+  """_apply_module_profile, then drop the lookup caches, which hold results
+  for the previous module's costs and structure."""
+  _apply_module_profile(serialized_hlo)
+  _wrapped_custom_call_cache.clear()
+  _inst_cost_cache.clear()
+
+
+def _called_computation_names(text: str) -> list:
+  """Names of the computations an instruction's text calls (to_apply= / calls=)."""
+  return _TO_APPLY_RE.findall(text) + _CALLS_RE.findall(text)
+
+
+def _wrapped_custom_call_name(async_start, comp_by_name: dict) -> Optional[str]:
+  """Name of the custom-call an async call-start/async-start runs, found by
+  walking its called computation (and nested call/async wrappers in it).
+
+  This is the name PGLE (after the "<fingerprint>::" prefix is stripped, see
+  _apply_module_profile) and the live XSpace corrections key the op's cost by:
+  the kernels are tagged with the custom-call's name, not with the wrapper's
+  root. Among the custom-calls at the shallowest level that has any, the one
+  with the largest profiled cost wins, else the first in instruction order.
+  Returns None if there is none.
+  """
+  try:
+    text = async_start.to_string()
+  except Exception:
+    return None
+  frontier = _called_computation_names(text)
+  seen: set = set()
+  for _ in range(_MAX_PROFILE_KEY_UNWRAP_HOPS):
+    custom_calls: list = []
+    nested: list = []
+    for comp_name in frontier:
+      comp = comp_by_name.get(comp_name)
+      if comp is None or comp_name in seen:
+        continue
+      seen.add(comp_name)
+      try:
+        for inst in comp.instructions():
+          opc = _opcode_str(inst)
+          if opc == "custom-call":
+            custom_calls.append(inst.name)
+          elif opc in ("call", "call-start", "async-start"):
+            nested.extend(_called_computation_names(inst.to_string()))
+      except Exception:
+        continue
+    if custom_calls:
+      costed = [n for n in custom_calls if _profile_costs.get(n)]
+      if costed:
+        return max(costed, key=lambda n: _profile_costs[n])
+      return custom_calls[0]
+    if not nested:
+      return None
+    frontier = nested
+  return None
 
 
 def _is_te_ep_call_start(inst, comp_by_name: dict) -> bool:
@@ -908,7 +993,24 @@ _MAX_RELOCATE_CHAIN = 64
 _HEAVY_COMPUTE_MIN_US = 5.0
 
 
+# _resolve_inst_cost results by instruction name (unique within a module).
+# A cost depends only on _profile_costs, _host_offload_copy_names and the
+# module's structure, so this is cleared wherever the first two are rebuilt
+# (_select_module_profile, _register_host_offload_copies) and at the start of
+# every _reorder_to_fixed_point call. Code that edits either directly (tests)
+# must clear it too.
+_inst_cost_cache: dict[str, float] = {}
+
+
 def _resolve_inst_cost(inst, comp_by_name: dict) -> float:
+  """Profiled cost (us) of inst (cached, see _inst_cost_cache)."""
+  c = _inst_cost_cache.get(inst.name)
+  if c is None:
+    c = _inst_cost_cache[inst.name] = _resolve_inst_cost_uncached(inst, comp_by_name)
+  return c
+
+
+def _resolve_inst_cost_uncached(inst, comp_by_name: dict) -> float:
   """Profiled cost (us) of inst.
 
   A kind=kCustom fusion (e.g. dynamic-slice-fusion around te_gemm_v2_ffi plus
@@ -1418,7 +1520,13 @@ def _chase_exposed_collective_blocker_earlier(
   if chase_start_pos <= window_start_pos:
     return False, seq, positions, name_to_pos
   chase_floor, chase_chain, _ = _earliest_legal_pos(chase_start, positions, name_to_pos, comp_by_name)
-  target = min(max(chase_floor, window_start_pos + 1), window_done_pos)
+  if chase_floor > window_done_pos:
+    # The chased start depends on something at or after the window's done
+    # (e.g. a te_ep_dispatch start reading its te_ep_prepare window's done):
+    # capping the target at window_done_pos would put it before its operand
+    # (and rely on schedule.update() to repair the use-before-def).
+    return False, seq, positions, name_to_pos
+  target = max(chase_floor, window_start_pos + 1)
   if target + len(chase_chain) >= chase_start_pos:
     return False, seq, positions, name_to_pos
 
@@ -3037,6 +3145,7 @@ def _reorder_to_fixed_point(module, schedule, module_name: str) -> bool:
   """
   global _fill_strategy_cache
   _fill_strategy_cache = {}
+  _inst_cost_cache.clear()
   changed = False
   # _reorder_collectives reports True whenever it moved anything, but two of its
   # steps can undo each other: the hoist-to-floor step moves a start to its
@@ -3093,7 +3202,7 @@ def _compute_collective_overlap(serialized_hlo: bytes) -> Optional[bytes]:
   schedule = module.schedule()
   if schedule is None:
     return None
-  _apply_module_profile(serialized_hlo)
+  _select_module_profile(serialized_hlo)
   if not _profile_costs:
     return None
 
