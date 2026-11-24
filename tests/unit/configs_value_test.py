@@ -96,6 +96,33 @@ class ConfigTest(absltest.TestCase):
     with self.assertRaises(pydantic.ValidationError):
       pyconfig.initialize(argv)
 
+  def test_te_dsv4_csa_rejects_dense_warmup_above_topk(self):
+    # 576 visible compressed blocks exceed the sparse kernel's 512-block budget.
+    config = {
+        "run_name": "test",
+        "decoder_block": types.DecoderBlockType.DEEPSEEK4,
+        "attention": "dot_product",
+        "hardware": "gpu",
+        "packing": False,
+        "te_dsv4_csa": True,
+        "attention_type": "compressed",
+        "q_lora_rank": 32,
+        "use_indexer": True,
+        "compress_ratios": [4, 128],
+        "base_num_query_heads": 64,
+        "head_dim": 512,
+        "indexer_n_heads": 64,
+        "indexer_head_dim": 128,
+        "indexer_topk": 512,
+        "sliding_window_size": 128,
+        "max_target_length": 2304,
+        "indexer_sparse_training": False,
+    }
+    # Disabling KL uses sparse selection even when the sparse-training flag is false.
+    self.assertTrue(types.MaxTextConfig(**config, indexer_loss_scaling_factor=0).te_dsv4_csa)
+    with self.assertRaisesRegex(pydantic.ValidationError, "does not support dense warmup"):
+      types.MaxTextConfig(**config, indexer_loss_scaling_factor=1)
+
   def test_te_moe_block_rejects_unsupported_options_during_config_validation(self):
     common_config = {
         "run_name": "test",

@@ -4307,6 +4307,9 @@ class MaxTextConfig(
               "with `use_tokamax_splash=True`."
           )
     if self.te_dsv4_csa:
+      # The sparse kernel keeps only top-k blocks, which truncates dense warmup.
+      if self.indexer_loss_scaling_factor > 0 and not self.indexer_sparse_training:
+        raise ValueError("`te_dsv4_csa=True` does not support dense warmup; enable `indexer_sparse_training`.")
       if self.decoder_block != DecoderBlockType.DEEPSEEK4:
         raise ValueError("`te_dsv4_csa=True` requires `decoder_block='deepseek4'`.")
       if self.hardware not in ("gpu", "gpu_multiprocess"):

@@ -107,6 +107,52 @@ def indexer_ratio4(
   )
 
 
+def indexer_sparse_kl_loss_ratio4(  # pylint: disable=too-many-positional-arguments
+    q,
+    compressed_k,
+    weights,
+    scores,
+    indices,
+    target,
+    *,
+    softmax_scale,
+    eps=1e-8,
+    sequence_descriptor=None,
+    max_seqlen_q=None,
+    max_seqlen_k=None,
+):
+  """Scalar BSHD/THD KL sum; normalization/coefficient belong to the model loss."""
+  from transformer_engine.jax.deepseek_v4 import dsa_indexer_sparse_kl_loss  # pylint: disable=import-outside-toplevel
+
+  if q.ndim == 3:
+    return dsa_indexer_sparse_kl_loss(
+        q.astype(jnp.bfloat16),
+        compressed_k[:, None, :].astype(jnp.bfloat16),
+        weights.astype(jnp.bfloat16),
+        scores.astype(jnp.float32),
+        indices,
+        target,
+        sm_scale=softmax_scale,
+        eps=eps,
+        sequence_descriptor=sequence_descriptor,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+    )
+  if q.ndim != 4 or any(x is not None for x in (sequence_descriptor, max_seqlen_q, max_seqlen_k)):
+    raise ValueError("dense indexer loss expects BHSD queries without packed metadata")
+  return dsa_indexer_sparse_kl_loss(
+      jnp.transpose(q, (0, 2, 1, 3)).astype(jnp.bfloat16),
+      compressed_k[:, :, None, :].astype(jnp.bfloat16),
+      weights.astype(jnp.bfloat16),
+      scores.astype(jnp.float32),
+      indices,
+      target,
+      sm_scale=softmax_scale,
+      eps=eps,
+      batch_axes=_CSA_BATCH_AXES,
+  )
+
+
 def sparse_attention_ratio4(
     q: Any,
     local_kv: Any,

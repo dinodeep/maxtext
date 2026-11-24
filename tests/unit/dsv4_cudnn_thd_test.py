@@ -17,8 +17,8 @@ from maxtext.kernels import dsv4_cudnn
 
 
 @pytest.mark.gpu_only
-@pytest.mark.parametrize("ratio", [4, 128])
-def test_prepared_thd_matches_independent_sequences(ratio):
+@pytest.mark.parametrize("ratio,native_kl", [(4, False), (128, False), (4, True)])
+def test_prepared_thd_matches_independent_sequences(ratio, native_kl, request):
   if not any(device.platform == "gpu" for device in jax.devices()):
     pytest.skip("requires an SM100 JAX device")
   from cudnn.tensor_adapter import get_compute_capability
@@ -28,6 +28,15 @@ def test_prepared_thd_matches_independent_sequences(ratio):
   from transformer_engine.jax.attention import SequenceDescriptor
   from transformer_engine.jax.deepseek_v4 import csa_compressor, dsa_sparse_attention
   from maxtext.layers.embeddings import DeepSeekV4RotaryEmbedding
+
+  if native_kl:
+    from transformer_engine.jax import deepseek_v4 as te_dsv4
+
+    def forbidden_backward(*_):
+      raise AssertionError("THD native KL traversed the reference indexer score VJP")
+
+    te_dsv4._dsa_indexer.defvjp(te_dsv4._dsa_indexer_fwd, forbidden_backward)
+    request.addfinalizer(lambda: te_dsv4._dsa_indexer.defvjp(te_dsv4._dsa_indexer_fwd, te_dsv4._dsa_indexer_bwd))
 
   lengths = (131, 257)
   coff = 2 if ratio == 4 else 1
@@ -81,18 +90,41 @@ def test_prepared_thd_matches_independent_sequences(ratio):
           (cu[None], cu_comp[None]),
       )
       # Exercise the actual MaxText adapter's THD branch, including its VJP.
+      score_inputs = (index_q, index_k, weights)
+      if native_kl:
+        score_inputs = jax.tree.map(jax.lax.stop_gradient, score_inputs)
       scores = dsv4_cudnn.indexer_ratio4(
-          index_q,
-          index_k,
-          weights,
+          *score_inputs,
           softmax_scale=128**-0.5,
           sequence_descriptor=descriptor,
           max_seqlen_q=max(seqlens),
           max_seqlen_k=(max(seqlens) + 3) // 4,
       )
+      if native_kl:
+        scores = jax.lax.stop_gradient(scores)
       chosen_scores, chosen = jax.lax.top_k(scores, 4)
       valid = jnp.isfinite(chosen_scores)
-      auxiliary = jnp.where(jnp.isfinite(scores), scores, 0).sum() * 1e-4
+      if native_kl:
+        selected = jnp.pad(jnp.where(valid, chosen, -1), ((0, 0), (0, 508)), constant_values=-1)
+        teacher = jnp.where(valid, 0.7 / jnp.maximum(valid.sum(-1, keepdims=True), 1), 0)
+        teacher = jnp.pad(teacher, ((0, 0), (0, 508)))
+        auxiliary = (
+            dsv4_cudnn.indexer_sparse_kl_loss_ratio4(
+                index_q,
+                index_k,
+                weights,
+                scores,
+                selected,
+                teacher,
+                softmax_scale=128**-0.5,
+                sequence_descriptor=descriptor,
+                max_seqlen_q=max(seqlens),
+                max_seqlen_k=(max(seqlens) + 3) // 4,
+            )
+            * 1e-4
+        )
+      else:
+        auxiliary = jnp.where(jnp.isfinite(scores), scores, 0).sum() * 1e-4
     else:
       chosen = jnp.broadcast_to(jnp.arange(max(counts)), (sum(seqlens), max(counts)))
       valid = chosen < jnp.array(counts)[seg, None]

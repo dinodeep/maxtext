@@ -15,6 +15,7 @@
 """Unit tests for DeepSeek-V4 Compressed Sparse Attention (CSA) Indexer loss and training."""
 
 import unittest
+import pytest
 from flax import nnx
 import jax
 import jax.numpy as jnp
@@ -635,6 +636,84 @@ class DeepSeekV4IndexerLossTest(unittest.TestCase):
     loss_sparse, aux_sparse = pre_train.loss_fn(mock_model, cfg_sparse, data, None, None, is_train=True)
     self.assertGreater(float(aux_sparse["xent_sum"]), 0.0)
     self.assertGreater(float(loss_sparse), 0.0)
+
+  @pytest.mark.gpu_only
+  def test_native_bshd_sparse_kl_matches_reference_gradients(self):
+    # The sentinel must replace the registered private VJP to detect traversal.
+    # pylint: disable=protected-access
+    from maxtext.kernels import dsv4_cudnn  # pylint: disable=import-outside-toplevel
+    from transformer_engine.jax import deepseek_v4 as te_dsv4  # pylint: disable=import-outside-toplevel
+
+    config = self._get_config(indexer_sparse_training=True, indexer_topk=2)
+    attn = self._init_csa_attention(config)
+    b, s, blocks = 2, 16, 4
+    key = jax.random.key(93)
+    q = jax.random.normal(key, (b, 64, s, 128), jnp.bfloat16)
+    k = jax.random.normal(jax.random.fold_in(key, 1), (b, blocks, 128), jnp.bfloat16)
+    weights = jax.random.normal(jax.random.fold_in(key, 2), (b, s, 64), jnp.bfloat16)
+    teacher_q = jax.random.normal(jax.random.fold_in(key, 3), (b, s, 4, 32), jnp.float32)
+    teacher_k = jax.random.normal(jax.random.fold_in(key, 4), (b, blocks, 1, 32), jnp.float32)
+    positions = jnp.broadcast_to(jnp.arange(s), (b, s))
+    causal = (jnp.arange(blocks)[None, None, :] + 1) * 4 <= positions[:, :, None] + 1
+    # The second batch has no teacher-valid queries; global token normalization stays shared.
+    allowed = causal & (jnp.arange(b)[:, None, None] == 0)
+    scale, coefficient = 0.17, 0.37
+
+    def dense_scores(x, y, w):
+      dots = jnp.einsum("bhsd,bkd->bhsk", x.astype(jnp.float32), y.astype(jnp.float32))
+      return jnp.einsum("bhsk,bsh->bsk", jax.nn.relu(dots), w.astype(jnp.float32)) * scale
+
+    def loss(x, y, w, tq, tk, *, native):
+      if native:
+        scores = jax.lax.stop_gradient(
+            dsv4_cudnn.indexer_ratio4(*jax.tree.map(jax.lax.stop_gradient, (x, y, w)), softmax_scale=scale)
+        )
+      else:
+        scores = dense_scores(x, y, w)
+      scores = jnp.where(allowed, scores, -jnp.inf)
+      selected_values, ids = jax.lax.top_k(scores, 2)
+      ids = jnp.where(jnp.isfinite(selected_values), ids, -1).astype(jnp.int32)
+      mask = jnp.where(jnp.any(ids[..., None] == jnp.arange(blocks), axis=-2), 0.0, DEFAULT_MASK_VALUE)
+      context = (x, y, w, ids, scale) if native else None
+      return attn.calculate_csa_indexer_loss(
+          scores,
+          tq,
+          tk,
+          mask,
+          position_ids=positions,
+          sparse_loss=True,
+          scaling_factor=coefficient,
+          native_loss_context=context,
+      )
+
+    operands = (q, k, weights, teacher_q, teacher_k)
+    with attn.mesh:
+      expected_value, expected = jax.jit(
+          jax.value_and_grad(lambda *xs: loss(*xs, native=False), argnums=(0, 1, 2, 3, 4))
+      )(*operands)
+
+      # Replace the actual registered VJP, not merely the Python function's name.
+      def forbidden_backward(*_):
+        raise AssertionError("native BSHD loss traversed the reference score backward")
+
+      te_dsv4._dsa_indexer.defvjp(te_dsv4._dsa_indexer_fwd, forbidden_backward)
+      try:
+        value, actual = jax.jit(jax.value_and_grad(lambda *xs: loss(*xs, native=True), argnums=(0, 1, 2, 3, 4)))(
+            *operands
+        )
+      finally:
+        te_dsv4._dsa_indexer.defvjp(te_dsv4._dsa_indexer_fwd, te_dsv4._dsa_indexer_bwd)
+    np.testing.assert_allclose(np.asarray(value), np.asarray(expected_value), atol=2e-5, rtol=2e-5)
+    for got, ref in zip(actual[:3], expected[:3]):
+      np.testing.assert_array_equal(np.asarray(got[1]), np.zeros(got[1].shape, np.float32))
+      np.testing.assert_array_equal(np.asarray(ref[1]), np.zeros(ref[1].shape, np.float32))
+      a, reference = np.asarray(got, np.float32).ravel(), np.asarray(ref, np.float32).ravel()
+      cosine = a @ reference / (np.linalg.norm(a) * np.linalg.norm(reference))
+      relative_rms = np.linalg.norm(a - reference) / np.linalg.norm(reference)
+      self.assertGreaterEqual(cosine, 0.999)
+      self.assertLessEqual(relative_rms, 0.02)
+    for got in actual[3:]:
+      np.testing.assert_array_equal(np.asarray(got), np.zeros(got.shape, np.float32))
 
 
 if __name__ == "__main__":
