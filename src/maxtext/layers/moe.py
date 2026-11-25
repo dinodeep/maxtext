@@ -7566,7 +7566,7 @@ class RoutedMoE(nnx.Module):
         wo_bias=wo_bias,
         num_experts=self.num_experts,
         activation_type=self.config.mlp_activations[0],
-        apply_topk_weights_early=True,
+        apply_topk_weights_early=wo_bias is None,
         quantizer_sets=(fc1_quantizer_set, fc2_quantizer_set),
         mesh_resource=MeshResource(dp_resource="data", fsdp_resource="fsdp", ep_resource=self._expert_parallelism_name),
         input_axes=("activation_batch", "activation_norm_length", None),
