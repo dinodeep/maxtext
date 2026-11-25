@@ -156,6 +156,7 @@ class FixedRandomRouterTest(unittest.TestCase):
         custom_mesh_and_rule="default",
         te_gmm_quantization="te_no_quant",
         te_moe_disable_cudnn_gmm_fusion=False,
+        te_moe_enable_ep_overlap=False,
         float32_gate_logits=True,
         dtype=jnp.float32,
         mlp_activations=("silu", "linear"),
@@ -179,6 +180,7 @@ class FixedRandomRouterTest(unittest.TestCase):
         per_expert_scale=None,
         wi_kernel_axes=(),
         wo_kernel_axes=(),
+        te_native_weight_layout=False,
         dtype=jnp.float32,
         should_update_load_balance=lambda: False,
     )

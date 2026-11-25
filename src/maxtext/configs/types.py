@@ -1683,6 +1683,38 @@ class MoEGeneral(BaseModel):
       False,
       description="Quantize TE MoE weight shards before the FSDP all-gather; false quantizes after gathering.",
   )
+  te_moe_enable_ep_overlap: bool = Field(
+      False,
+      description=(
+          "Pass enable_ep_overlap=True to te_moe.moe(): EP dispatch/combine overlapped with CuTeDSL grouped GEMMs "
+          "(no fallback: TE runs the overlap or raises). Bootstraps NCCL EP with num_topk=num_experts_per_tok and "
+          "max_num_sms=te_moe_ep_max_num_sms (must be > 0). Needs NVTE_ENABLE_CUTEDSL_BACKEND=1 and NVTE_MOE_OVERLAP "
+          "in the environment, or te_moe_ep_overlap_kernel_dir. Requires te_moe_block=True and mlp_bias=False."
+      ),
+  )
+  te_moe_native_weight_layout: bool = Field(
+      False,
+      description=(
+          "Store TE MoE expert weights in the layouts the EP-overlap GEMMs read: wi [E, 2*mlp, embed] with gate/up "
+          "in alternating 32-row blocks and wo [E, embed, mlp] (te_moe.moe cudnn_native_weight_layout=True, "
+          "fc2_native_weight_layout=True). Initial values equal the default layout's (same RNG draws). Not "
+          "checkpoint-compatible with the default layout. Requires te_moe_block=True (hence prefuse_moe_weights)."
+      ),
+  )
+  te_moe_ep_overlap_kernel_dir: str = Field(
+      "",
+      description=(
+          "EPCompOverlap CuTeDSL gemm/ tree for te_moe_enable_ep_overlap: if set, exported as NVTE_MOE_OVERLAP "
+          "(and NVTE_ENABLE_CUTEDSL_BACKEND=1) before the TE EP bootstrap. Empty keeps the environment as is."
+      ),
+  )
+  te_moe_ep_max_num_sms: NonNegativeInt = Field(
+      0,
+      description=(
+          "SM budget of the NCCL EP dispatch/combine kernels (TE ep_bootstrap max_num_sms); 0 lets NCCL EP choose. "
+          "te_moe_enable_ep_overlap=True requires a value > 0 (24 is a good starting point)."
+      ),
+  )
   te_ep_overflow_check_every_n_steps: PositiveInt = Field(
       20,
       description=(
@@ -8354,6 +8386,16 @@ class MaxTextConfig(
           raise ValueError("te_moe_quantize_before_fsdp_all_gather=True does not support 2D FSDP weight sharding.")
       if self.te_moe_block and not self.prefuse_moe_weights:
         raise ValueError("te_moe_block=True requires prefuse_moe_weights=True.")
+      if (self.te_moe_enable_ep_overlap or self.te_moe_native_weight_layout) and not self.te_moe_block:
+        raise ValueError("te_moe_enable_ep_overlap / te_moe_native_weight_layout require te_moe_block=True.")
+      if self.te_moe_native_weight_layout and self.moe_flat_fsdp_weights:
+        raise ValueError("te_moe_native_weight_layout=True does not support moe_flat_fsdp_weights=True.")
+      if self.te_moe_enable_ep_overlap and self.mlp_bias:
+        raise ValueError("te_moe_enable_ep_overlap=True does not support MoE FFN biases (mlp_bias=True).")
+      if self.te_moe_enable_ep_overlap and self.te_moe_ep_max_num_sms <= 0:
+        raise ValueError(
+            "te_moe_enable_ep_overlap=True requires te_moe_ep_max_num_sms > 0 (NCCL EP SM budget; 24 recommended)."
+        )
       if self.te_moe_block and self.norm_topk_prob and self.routed_score_func not in ["sqrtsoftplus", "sigmoid"]:
         raise ValueError(
             "te_moe_block=True does not currently support norm_topk_prob=True "

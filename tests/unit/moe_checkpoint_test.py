@@ -17,6 +17,11 @@
 # These tests directly exercise the private checkpoint compatibility helper.
 # pylint: disable=protected-access
 
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+
 from maxtext.layers import moe
 
 
@@ -97,3 +102,33 @@ def test_te_moe_weight_layout_is_omitted_for_older_signature():
     pass
 
   assert not moe._get_te_moe_weight_layout_kwargs(te_moe)
+
+
+def test_te_moe_native_weight_layout_kwargs():
+  def te_moe(*, cudnn_native_weight_layout=None, fc2_native_weight_layout=False):
+    del cudnn_native_weight_layout, fc2_native_weight_layout
+
+  assert moe._get_te_moe_weight_layout_kwargs(te_moe, native_weight_layout=True) == {
+      "cudnn_native_weight_layout": True,
+      "fc2_native_weight_layout": True,
+  }
+
+
+def test_te_moe_overlap_kwargs():
+  def te_moe(*, enable_ep_overlap=False):
+    del enable_ep_overlap
+
+  assert not moe._get_te_moe_overlap_kwargs(te_moe, False)
+  assert moe._get_te_moe_overlap_kwargs(te_moe, True) == {"enable_ep_overlap": True}
+
+
+def test_te_moe_fc1_to_native_preserves_values():
+  pytest.importorskip("transformer_engine.jax.cpp_extensions")
+  wi = jax.random.normal(jax.random.key(0), (2, 4, 128))  # [E, K, 2N], N = 64: two 32-row blocks per half
+  native = moe.te_moe_fc1_to_native(wi)
+  assert native.shape == (2, 128, 4)
+  gate, up = wi[..., :64], wi[..., 64:]
+  np.testing.assert_array_equal(native[:, 0:32], jnp.swapaxes(gate[..., 0:32], -1, -2))
+  np.testing.assert_array_equal(native[:, 32:64], jnp.swapaxes(up[..., 0:32], -1, -2))
+  np.testing.assert_array_equal(native[:, 64:96], jnp.swapaxes(gate[..., 32:64], -1, -2))
+  np.testing.assert_array_equal(native[:, 96:128], jnp.swapaxes(up[..., 32:64], -1, -2))

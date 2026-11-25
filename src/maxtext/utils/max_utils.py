@@ -1466,9 +1466,18 @@ def maybe_bootstrap_te_moe(config, mesh, shaped_batch):
         f"TE MoE EP was already bootstrapped with {_te_moe_bootstrap_signature}, " f"but this run needs {signature}."
     )
 
+  bootstrap_kwargs = {"max_num_sms": config.te_moe_ep_max_num_sms}
+  if config.te_moe_enable_ep_overlap:
+    # The overlap env must be set before the bootstrap; NCCL EP needs the top-k to select the pull-push flow
+    # whose readiness signals the overlapped GEMMs follow.
+    if config.te_moe_ep_overlap_kernel_dir:
+      os.environ["NVTE_MOE_OVERLAP"] = config.te_moe_ep_overlap_kernel_dir
+      os.environ["NVTE_ENABLE_CUTEDSL_BACKEND"] = "1"
+    bootstrap_kwargs["num_topk"] = config.num_experts_per_tok
+
   with jax.set_mesh(mesh), mesh:
     max_logging.log(
-        "Bootstrapping TE MoE EP: "
+        f"Bootstrapping TE MoE EP ({bootstrap_kwargs}): "
         f"world={jax.process_count()} rank={jax.process_index()} ep={ep_size} "
         f"num_experts={config.num_experts} max_tokens_per_rank={max_tokens_per_rank} "
         f"recv_capacity_per_rank={recv_capacity_per_rank} hidden_dim={hidden_dim} "
@@ -1483,6 +1492,7 @@ def maybe_bootstrap_te_moe(config, mesh, shaped_batch):
         hidden_dim=hidden_dim,
         max_token_dtype=config.dtype,
         drop_on_overflow=drop_on_overflow,
+        **bootstrap_kwargs,
     )
     record_ep_bootstrap_signature_for_moe(
         num_experts=config.num_experts,

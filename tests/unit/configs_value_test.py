@@ -254,6 +254,33 @@ class ConfigTest(absltest.TestCase):
     ):
       types.MaxTextConfig(**common_config, te_moe_disable_cudnn_gmm_fusion=True)
 
+  def test_te_moe_ep_overlap_validation(self):
+    common = {
+        "run_name": "test",
+        "num_experts": 2,
+        "base_moe_mlp_dim": 7168,
+        "first_num_dense_layers": 1,
+        "sparse_matmul": True,
+        "prefuse_moe_weights": True,
+        "te_moe_block": True,
+        "te_gmm_quantization": "te_no_quant",
+        "te_moe_enable_ep_overlap": True,
+        "te_moe_native_weight_layout": True,
+        "te_moe_ep_max_num_sms": 24,
+        "override_logical_axis_rules": True,
+    }
+    config = types.MaxTextConfig(**common)
+    self.assertTrue(config.te_moe_enable_ep_overlap and config.te_moe_native_weight_layout)
+    for overrides, error in (
+        ({"te_moe_ep_max_num_sms": 0}, "te_moe_ep_max_num_sms > 0"),
+        ({"te_moe_block": False}, "require te_moe_block=True"),
+        ({"te_moe_block": False, "te_moe_enable_ep_overlap": False}, "require te_moe_block=True"),
+        ({"mlp_bias": True}, "mlp_bias=True"),
+    ):
+      with self.subTest(overrides=overrides):
+        with self.assertRaisesRegex(pydantic.ValidationError, error):
+          types.MaxTextConfig(**{**common, **overrides})
+
   def test_te_moe_quantized_weight_gather_validation(self):
     common = {
         "run_name": "test",

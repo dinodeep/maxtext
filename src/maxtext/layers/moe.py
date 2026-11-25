@@ -115,14 +115,38 @@ def _get_te_moe_cudnn_gmm_fusion_kwargs(disable_cudnn_gmm_fusion: bool) -> dict[
   return {"use_cudnn_fusion": False} if disable_cudnn_gmm_fusion else {}
 
 
-def _get_te_moe_weight_layout_kwargs(moe_fn) -> dict[str, bool]:
-  """Declare MaxText's standard [E, K, 2N] FC1 storage when TE accepts the layout flag.
+def _get_te_moe_weight_layout_kwargs(moe_fn, native_weight_layout: bool = False) -> dict[str, bool]:
+  """Declare MaxText's FC1/FC2 storage when TE accepts the layout flags.
 
-  TE infers the layout from the FC1 shape, which is ambiguous when K == 2N (e.g. DeepSeek V4).
+  Default: standard [E, K, 2N] FC1 storage (TE infers the layout from the FC1 shape, which is ambiguous when
+  K == 2N, e.g. DeepSeek V4). native_weight_layout (te_moe_native_weight_layout): FC1 [E, 2N, K] with gate/up
+  in alternating 32-row blocks and FC2 [E, K, N], the layouts the EP-overlap GEMMs read.
   """
-  if "cudnn_native_weight_layout" in inspect.signature(moe_fn).parameters:
+  parameters = inspect.signature(moe_fn).parameters
+  if native_weight_layout:
+    if "fc2_native_weight_layout" not in parameters:
+      raise ImportError("te_moe_native_weight_layout=True requires TransformerEngine with fc2_native_weight_layout.")
+    return {"cudnn_native_weight_layout": True, "fc2_native_weight_layout": True}
+  if "cudnn_native_weight_layout" in parameters:
     return {"cudnn_native_weight_layout": False}
   return {}
+
+
+def _get_te_moe_overlap_kwargs(moe_fn, enable_ep_overlap: bool) -> dict[str, bool]:
+  """enable_ep_overlap for te_moe.moe(); empty (TE default, off) when the flag is off."""
+  if not enable_ep_overlap:
+    return {}
+  if "enable_ep_overlap" not in inspect.signature(moe_fn).parameters:
+    raise ImportError("te_moe_enable_ep_overlap=True requires TransformerEngine with moe(enable_ep_overlap=...).")
+  return {"enable_ep_overlap": True}
+
+
+def te_moe_fc1_to_native(wi: jax.Array) -> jax.Array:
+  """[..., E, K, 2N] (gate | up) -> [..., E, 2N, K] with gate/up in alternating 32-row blocks."""
+  from transformer_engine.jax.cpp_extensions import pack_gated_activation_pair  # pylint: disable=import-outside-toplevel
+
+  gate, up = jnp.split(wi, 2, axis=-1)
+  return jnp.swapaxes(pack_gated_activation_pair(gate, up), -1, -2)
 
 
 @jax.custom_vjp
@@ -1947,6 +1971,14 @@ class RoutedMoE(nnx.Module):
         self.wi_kernel_axes = (CompoundLogicalAxis(("exp", "embed_moe")), "mlp_moe")
         self.wo_kernel_axes = (CompoundLogicalAxis(("exp", "embed_moe")), None)
 
+    self.te_native_weight_layout = self.config.te_moe_native_weight_layout
+    if self.te_native_weight_layout:
+      if len(self.wi_kernel_axes) != 3 or len(self.wo_kernel_axes) != 3:
+        raise ValueError("te_moe_native_weight_layout=True requires the standard 3D [E, rows, cols] expert weights.")
+      # Storage is wi [E, 2*mlp, embed] / wo [E, embed, mlp]: swap the two non-expert logical axes.
+      self.wi_kernel_axes = (self.wi_kernel_axes[0], self.wi_kernel_axes[2], self.wi_kernel_axes[1])
+      self.wo_kernel_axes = (self.wo_kernel_axes[0], self.wo_kernel_axes[2], self.wo_kernel_axes[1])
+
     if self.config.attention in ("vllm_rpa", "vllm_batched_rpa"):
       # vLLM uses 'model' as the tensor parallelism axis name
       self._tensor_parallelism_name = ("model", "attn_dp")
@@ -2084,30 +2116,30 @@ class RoutedMoE(nnx.Module):
       self.wi_1 = jnp.zeros((num_experts, self.moe_expert_input_dim, intermediate_dim))
       self.wo = jnp.zeros((num_experts, intermediate_dim, self.moe_expert_input_dim))
     elif self.config.prefuse_moe_weights:
-      self.wi = nnx.Param(
-          self.kernel_init(
-              self.rngs.params(),
-              (num_experts, self.moe_expert_input_dim, moe_intermediate_dim * 2),
-              weight_dtype,
-              kernel_in_axis,
-              kernel_out_axis,
-          ),
-          out_sharding=self.wi_kernel_axes,
+      wi_init = self.kernel_init(
+          self.rngs.params(),
+          (num_experts, self.moe_expert_input_dim, moe_intermediate_dim * 2),
+          weight_dtype,
+          kernel_in_axis,
+          kernel_out_axis,
       )
-      self.wo = nnx.Param(
-          self.kernel_init(
-              self.rngs.params(),
-              (
-                  self.num_experts,
-                  moe_intermediate_dim,
-                  self.moe_expert_input_dim,
-              ),
-              self.weight_dtype,
-              kernel_in_axis,
-              kernel_out_axis,
+      wo_init = self.kernel_init(
+          self.rngs.params(),
+          (
+              self.num_experts,
+              moe_intermediate_dim,
+              self.moe_expert_input_dim,
           ),
-          out_sharding=self.wo_kernel_axes,
+          self.weight_dtype,
+          kernel_in_axis,
+          kernel_out_axis,
       )
+      if self.te_native_weight_layout:
+        # Same initial values as the default layout (same RNG draws), stored as the EP-overlap GEMMs read them.
+        wi_init = te_moe_fc1_to_native(wi_init)
+        wo_init = jnp.swapaxes(wo_init, -1, -2)
+      self.wi = nnx.Param(wi_init, out_sharding=self.wi_kernel_axes)
+      self.wo = nnx.Param(wo_init, out_sharding=self.wo_kernel_axes)
     else:
 
       def _init_expert_kernel(shape, dtype):
@@ -6929,7 +6961,8 @@ class RoutedMoE(nnx.Module):
 
     checkpoint_kwargs = _get_te_moe_checkpoint_kwargs(te_moe.moe)
     cudnn_gmm_fusion_kwargs = _get_te_moe_cudnn_gmm_fusion_kwargs(self.config.te_moe_disable_cudnn_gmm_fusion)
-    weight_layout_kwargs = _get_te_moe_weight_layout_kwargs(te_moe.moe)
+    weight_layout_kwargs = _get_te_moe_weight_layout_kwargs(te_moe.moe, self.te_native_weight_layout)
+    overlap_kwargs = _get_te_moe_overlap_kwargs(te_moe.moe, self.config.te_moe_enable_ep_overlap)
 
     # Older TE versions take the router arguments directly and do not return expert counts.
     supports_router_info = hasattr(te_moe, "RouterComputationInfo")
@@ -7017,6 +7050,7 @@ class RoutedMoE(nnx.Module):
         **router_kwargs,
         **cudnn_gmm_fusion_kwargs,
         **weight_layout_kwargs,
+        **overlap_kwargs,
         **checkpoint_kwargs,
     )
     if supports_router_info:

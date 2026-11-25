@@ -15,6 +15,7 @@
 """Tests of per-invocation TE EP capacity sizing without TE or GPU execution."""
 
 from contextlib import nullcontext
+import os
 import sys
 from types import ModuleType, SimpleNamespace
 import unittest
@@ -42,6 +43,9 @@ class TeMoeBootstrapTest(unittest.TestCase):
         moe_expert_input_dim=0,
         emb_dim=7168,
         dtype=jnp.bfloat16,
+        te_moe_enable_ep_overlap=False,
+        te_moe_ep_overlap_kernel_dir="",
+        te_moe_ep_max_num_sms=0,
     )
     self.mesh = mock.MagicMock(shape={"fsdp": 4, "expert": 4})
     ep = ModuleType("transformer_engine.jax.ep")
@@ -125,6 +129,22 @@ class TeMoeBootstrapTest(unittest.TestCase):
     self.bootstrap_batch()
     self.bootstrap_batch()
     self.bootstrap.assert_called_once()
+
+  def test_ep_overlap_bootstrap_kwargs(self):
+    self.bootstrap_batch()
+    self.assertEqual(self.bootstrap.call_args.kwargs["max_num_sms"], 0)
+    self.assertNotIn("num_topk", self.bootstrap.call_args.kwargs)
+
+  def test_ep_overlap_bootstrap_sets_topk_sms_and_env(self):
+    self.config.te_moe_enable_ep_overlap = True
+    self.config.te_moe_ep_max_num_sms = 24
+    self.config.te_moe_ep_overlap_kernel_dir = "/kernels/gemm"
+    with mock.patch.dict("os.environ", {}, clear=False):
+      self.bootstrap_batch()
+      self.assertEqual(os.environ["NVTE_MOE_OVERLAP"], "/kernels/gemm")
+      self.assertEqual(os.environ["NVTE_ENABLE_CUTEDSL_BACKEND"], "1")
+    self.assertEqual(self.bootstrap.call_args.kwargs["max_num_sms"], 24)
+    self.assertEqual(self.bootstrap.call_args.kwargs["num_topk"], 8)
 
   def test_non_te_model_skips_bootstrap(self):
     self.config.te_moe_block = False
