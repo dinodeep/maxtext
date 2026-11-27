@@ -138,6 +138,7 @@ def _operands(inst) -> list:
     ops = _operands_of[inst] = list(inst.operands())
   return ops
 
+
 _logger = logging.getLogger(__name__)
 _logger.setLevel(logging.DEBUG)
 if not _logger.handlers:
@@ -1165,8 +1166,10 @@ def _prefix_costs_excluding(seq: list, exclude: set, comp_by_name: dict) -> list
         return cached_prefix
   get = _cost_of.get
   if exclude:
-    costs = [0.0 if inst in exclude else (get(inst) if inst in _cost_of else _resolve_inst_cost(inst, comp_by_name))
-             for inst in seq]
+    costs = [
+        0.0 if inst in exclude else (get(inst) if inst in _cost_of else _resolve_inst_cost(inst, comp_by_name))
+        for inst in seq
+    ]
   else:
     costs = [c if (c := get(inst)) is not None else _resolve_inst_cost(inst, comp_by_name) for inst in seq]
   prefix = list(accumulate(costs, initial=0.0))
@@ -3666,8 +3669,24 @@ _NCCL_START_OPCODES = frozenset(
     }
 )
 _PRINTED_OPCODE_RE = re.compile(r"[}\])] ([a-z][a-z0-9-]*)\(")
-_SHAPE_BYTES = {"f8e4m3fn": 1, "f8e5m2": 1, "f8e8m0fnu": 1, "bf16": 2, "f16": 2, "f32": 4, "s32": 4, "u32": 4,
-                "s8": 1, "u8": 1, "pred": 1, "s64": 8, "u64": 8, "f64": 8, "s16": 2, "u16": 2}
+_SHAPE_BYTES = {
+    "f8e4m3fn": 1,
+    "f8e5m2": 1,
+    "f8e8m0fnu": 1,
+    "bf16": 2,
+    "f16": 2,
+    "f32": 4,
+    "s32": 4,
+    "u32": 4,
+    "s8": 1,
+    "u8": 1,
+    "pred": 1,
+    "s64": 8,
+    "u64": 8,
+    "f64": 8,
+    "s16": 2,
+    "u16": 2,
+}
 _SHAPE_RE = re.compile(r"\b([a-z0-9]+)\[([0-9,]*)\]")
 
 
@@ -3908,6 +3927,622 @@ def _verify_schedule(module, schedule, snap: dict) -> list:
   return problems
 
 
+# ---------------------------------------------------------------------------
+# Buffer-sharing rule (patch 0005).
+#
+# XLA's copy insertion (incl. RemoveUnnecessaryCopies in
+# RunPostSchedulingCopyInsertion) runs BEFORE this kPostScheduler pass and
+# decides which HLO values share a buffer using the *input* schedule. Values
+# that must share a buffer (HloAliasAnalysis must-alias rules) are only safe in
+# an order where the last read of one value precedes the write of the next.
+# The pass only checked data/control dependencies, so it could hoist e.g. an
+# async all-gather start whose output reaches the while-body ROOT[i] without a
+# copy above a reader of loop parameter element i (same buffer): NCCL then
+# overwrites the value before it is read (DSv4 proxy, job 3847345).
+#
+# This section re-implements the must-alias rules of HloAliasAnalysis on the
+# instruction text (the Python binding has no alias analysis):
+#   * bitcast / get-tuple-element / tuple / opt-barrier / add-dependency do not
+#     define values (they forward their operand's values);
+#   * async *-done forwards the start's output {1} (copy-done: {0}); an async
+#     start's {0, i} is operand i (the operand is read until the done);
+#   * while: output leaf p, init leaf p (caller) share a buffer; inside the body
+#     parameter leaf p and ROOT leaf p share a buffer (loop-carried);
+#   * in-place ops: output_to_operand_aliasing (custom-call, call, fusion, async
+#     starts incl. all-reduce-start), dynamic-update-slice / scatter, fusions
+#     whose fused root is an in-place op on a fused parameter (recursively);
+# and derives, from the input schedule, ordering edges between instructions:
+#   WAR: a reader (async reader: its done) of value A before the writer of a
+#        later value B in the same buffer (async writer: its start);
+#   WAW: the writer of A (async: its done) before the writer of B.
+# Only edges that hold in the input schedule are kept, so the input schedule
+# satisfies all of them and re-sorting with them can never create a cycle.
+# RAW is covered by data dependencies plus WAW.
+# ---------------------------------------------------------------------------
+_BH_NAME_RE = re.compile(r"^\s*(ROOT\s+)?%([^\s=]+) = ")
+_BH_COMMENT_RE = re.compile(r"/\*.*?\*/")
+_BH_OPERAND_RE = re.compile(r"%([\w.\-]+)")
+_BH_INDEX_RE = re.compile(r"\bindex=(\d+)")
+_BH_CALLS_RE = re.compile(r"\bcalls=%([\w.\-]+)")
+_BH_WHILE_BODY_RE = re.compile(r"\bbody=%([\w.\-]+)")
+_BH_ALIAS_ATTR_RE = re.compile(r"output_to_operand_aliasing=\{(.*?\})\}")
+_BH_ALIAS_PAIR_RE = re.compile(r"\{([0-9, ]*)\}: \((\d+), \{([0-9, ]*)\}\)")
+_BH_FORWARDING = frozenset({"bitcast", "get-tuple-element", "tuple", "opt-barrier", "add-dependency"})
+_BH_NOT_ASYNC_DONE = frozenset({"send-done", "recv-done"})
+
+
+def _bh_balanced(s: str, i: int) -> int:
+  """Index just past the parenthesis group that opens at s[i]."""
+  d = 0
+  for j in range(i, len(s)):
+    ch = s[j]
+    if ch == "(":
+      d += 1
+    elif ch == ")":
+      d -= 1
+      if d == 0:
+        return j + 1
+  return len(s)
+
+
+def _bh_parse_shape(s: str):
+  """Shape text -> tree: None for an array/token leaf, list of subtrees for a tuple."""
+  pos = 0
+
+  def node():
+    nonlocal pos
+    while pos < len(s) and s[pos] == " ":
+      pos += 1
+    if pos < len(s) and s[pos] == "(":
+      pos += 1
+      kids = []
+      while True:
+        while pos < len(s) and s[pos] in " ,":
+          pos += 1
+        if pos >= len(s):
+          return kids
+        if s[pos] == ")":
+          pos += 1
+          return kids
+        kids.append(node())
+    depth = 0
+    while pos < len(s):
+      ch = s[pos]
+      if ch in "[{":
+        depth += 1
+      elif ch in "]}":
+        depth -= 1
+      elif depth == 0 and ch in ",)":
+        break
+      pos += 1
+    return None
+
+  return node()
+
+
+def _bh_parse_line(line: str):
+  """(name, is_root, shape tree, printed opcode, operand names, attribute text) of one instruction line."""
+  line = _BH_COMMENT_RE.sub("", line)
+  m = _BH_NAME_RE.match(line)
+  if not m:
+    return None
+  rest = line[m.end() :]
+  if rest.startswith("("):
+    j = _bh_balanced(rest, 0)
+    shape_s, rest = rest[:j], rest[j:].lstrip()
+  else:
+    shape_s, _, rest = rest.partition(" ")
+  k = rest.find("(")
+  opcode = rest[:k] if k >= 0 else rest.strip()
+  if k >= 0:
+    e = _bh_balanced(rest, k)
+    raw = rest[k + 1 : e - 1]
+    ops = _BH_OPERAND_RE.findall(raw)
+    attrs = rest[e:]
+  else:
+    ops, attrs, raw = [], "", ""
+  if opcode == "parameter":
+    attrs = raw + attrs  # keep the parameter number
+  return m.group(2), bool(m.group(1)), _bh_parse_shape(shape_s), opcode, ops, attrs
+
+
+def _bh_leaves(tree, prefix=()):
+  if tree is None:
+    return [prefix]
+  out = []
+  for i, t in enumerate(tree):
+    out.extend(_bh_leaves(t, prefix + (i,)))
+  return out
+
+
+def _bh_subtree(tree, path):
+  for i in path:
+    if tree is None or i >= len(tree):
+      return None
+    tree = tree[i]
+  return tree
+
+
+def _bh_alias_pairs(attrs: str) -> list:
+  """[(output path, operand number, operand path)] of output_to_operand_aliasing."""
+  m = _BH_ALIAS_ATTR_RE.search(attrs)
+  if not m:
+    return []
+  tup = lambda t: tuple(int(x) for x in t.replace(" ", "").split(",") if x)
+  return [(tup(o), int(n), tup(p)) for o, n, p in _BH_ALIAS_PAIR_RE.findall(m.group(1))]
+
+
+class _BhFusedInfo:
+  """In-place (operand number, operand path) <-> output path pairs of fusions,
+  from their fused computations (GetFusionInstructionInPlaceInputOutputPairs)."""
+
+  def __init__(self, get_comp_lines):
+    self._get = get_comp_lines  # name -> (list of instruction lines, root name) or None
+    self._memo = {}
+
+  def passthrough(self, body: str) -> set:
+    """Leaf paths p with while-body ROOT{p} == parameter{p} (loop-invariant: not written by the loop)."""
+    key = ("pt", body)
+    if key in self._memo:
+      return self._memo[key]
+    self._memo[key] = set()
+    got = self._get(body)
+    if not got:
+      return set()
+    lines, root = got
+    m = _BhModel(lines, root, None)
+    params = [r[0] for r in m.recs if r[3] == "parameter"]
+    out = set()
+    if len(params) == 1 and root in m.by:
+      for p in _bh_leaves(m.recs[m.by[root]][2]):
+        if m.src(root, p) == (params[0], p):
+          out.add(p)
+    self._memo[key] = out
+    return out
+
+  def pairs(self, comp_name: str, out_tree) -> list:
+    key = comp_name
+    if key in self._memo:
+      return self._memo[key]
+    self._memo[key] = []
+    got = self._get(comp_name)
+    if not got:
+      return []
+    lines, root = got
+    recs = {}
+    for l in lines:
+      r = _bh_parse_line(l)
+      if r:
+        recs[r[0]] = r
+    if root not in recs:
+      return []
+
+    def follow(name, path):
+      # FollowTupleIndirection + FollowNoOpIndirection (bitcast)
+      for _ in range(64):
+        r = recs.get(name)
+        if r is None:
+          return name, path
+        if r[3] == "tuple" and path:
+          name, path = r[4][path[0]], path[1:]
+        elif r[3] == "get-tuple-element":
+          m = _BH_INDEX_RE.search(r[5])
+          name, path = r[4][0], (int(m.group(1)),) + path
+        elif r[3] == "bitcast":
+          name = r[4][0]
+        else:
+          return name, path
+      return name, path
+
+    out = []
+    for p in _bh_leaves(out_tree):
+      src, sp = follow(root, p)
+      r = recs.get(src)
+      if r is None:
+        continue
+      cand = []
+      if r[3] == "dynamic-update-slice" and sp == ():
+        cand.append((0, ()))
+      elif r[3] == "scatter":
+        n = (len(r[4]) - 1) // 2
+        if n == 1 and sp == ():
+          cand.append((0, ()))
+        elif len(sp) == 1 and sp[0] < n:
+          cand.append((sp[0], ()))
+      elif r[3] == "fusion":
+        m = _BH_CALLS_RE.search(r[5])
+        if m:
+          for (on, opath), oout in self.pairs(m.group(1), r[2]):
+            if oout == sp:
+              cand.append((on, opath))
+      cand.extend((n, pp) for oo, n, pp in _bh_alias_pairs(r[5]) if oo == sp)
+      for on, opath in cand:
+        if on >= len(r[4]):
+          continue
+        s2, p2 = follow(r[4][on], opath)
+        r2 = recs.get(s2)
+        if r2 is not None and r2[3] == "fusion":
+          m = _BH_CALLS_RE.search(r2[5])
+          if m:
+            for (nn, np_), nout in self.pairs(m.group(1), r2[2]):
+              if nout == p2 and nn < len(r2[4]):
+                s2, p2 = follow(r2[4][nn], np_)
+                r2 = recs.get(s2)
+                break
+        if r2 is not None and r2[3] == "parameter":
+          out.append(((_bh_param_number(r2), p2), p))
+          break
+    self._memo[key] = out
+    return out
+
+
+def _bh_param_number(rec) -> int:
+  # the parser keeps "N" of parameter(N) at the start of the attribute text
+  m = re.match(r"\s*(\d+)", rec[5])
+  return int(m.group(1)) if m else 0
+
+
+class _BhModel:
+  """Must-alias buffers and ordering edges of one scheduled computation.
+
+  lines: instruction texts in schedule order. root: name of the ROOT.
+  fused: _BhFusedInfo for in-place fusions."""
+
+  def __init__(self, lines: list, root: str, fused: "_BhFusedInfo"):
+    self.recs = []
+    self.by = {}
+    for l in lines:
+      r = _bh_parse_line(l)
+      if r is None:
+        continue
+      self.by[r[0]] = len(self.recs)
+      self.recs.append(r)
+    self.root = root
+    self.fused = fused
+    self.conflict_examples = []
+    self.pos = {r[0]: i for i, r in enumerate(self.recs)}
+    self._src_memo = {}
+    self._parent = {}
+    self.done_of = {}
+    for r in self.recs:
+      if r[3].endswith("-done") and r[3] not in _BH_NOT_ASYNC_DONE and r[4]:
+        self.done_of.setdefault(r[4][0], r[0])
+
+  # -- values ---------------------------------------------------------------
+  def src(self, name: str, path: tuple) -> tuple:
+    """The (defining instruction, path) of the value at (name, path)."""
+    key = (name, path)
+    hit = self._src_memo.get(key)
+    if hit is not None:
+      return hit
+    out = key
+    i = self.by.get(name)
+    if i is not None:
+      _, _, tree, opc, ops, attrs = self.recs[i]
+      if opc in ("bitcast", "opt-barrier", "add-dependency") and ops:
+        out = self.src(ops[0], path)
+      elif opc == "get-tuple-element" and ops:
+        m = _BH_INDEX_RE.search(attrs)
+        out = self.src(ops[0], (int(m.group(1)),) + path)
+      elif opc == "tuple" and path and path[0] < len(ops):
+        out = self.src(ops[path[0]], path[1:])
+      elif opc == "while" and ops and self.fused is not None:
+        mb = _BH_WHILE_BODY_RE.search(attrs)
+        if mb and path in self.fused.passthrough(mb.group(1)):
+          out = self.src(ops[0], path)  # loop-invariant leaf: the while does not write it
+      elif opc.endswith("-done") and opc not in _BH_NOT_ASYNC_DONE and ops:
+        st = self.by.get(ops[0])
+        st_tree = self.recs[st][2] if st is not None else None
+        if opc == "copy-done":
+          out = self.src(ops[0], (0,) + path)
+        elif st_tree is None:
+          out = self.src(ops[0], path)  # non-tuple start (old all-reduce-start form)
+        else:
+          out = self.src(ops[0], (1,) + path)
+      elif (opc.endswith("-start") or opc == "async-start") and path:
+        if opc == "copy-start":
+          if path[0] == 1 and ops:
+            out = self.src(ops[0], path[1:])
+        elif path[0] == 0 and ops and tree is not None:
+          e0 = tree[0] if tree else None
+          if isinstance(e0, list) and len(e0) == len(ops) and len(path) >= 2:
+            out = self.src(ops[path[1]], path[2:])
+          elif len(ops) == 1 and not (isinstance(e0, list) and len(e0) == 1):
+            out = self.src(ops[0], path[1:])
+    self._src_memo[key] = out
+    return out
+
+  def _find(self, k):
+    p = self._parent.get(k, k)
+    if p == k:
+      return k
+    r = self._find(p)
+    self._parent[k] = r
+    return r
+
+  def _union(self, a, b):
+    self._parent.setdefault(a, a)
+    self._parent.setdefault(b, b)
+    ra, rb = self._find(a), self._find(b)
+    if ra != rb:
+      self._parent[ra] = rb
+
+  def _alias_edges(self):
+    """Union the must-alias values; returns {value: reason}."""
+    why = {}
+    for name, is_root, tree, opc, ops, attrs in self.recs:
+      pairs = []  # (output path, operand number, operand path)
+      if opc == "while" and ops:
+        pairs = [(p, 0, p) for p in _bh_leaves(tree)]  # pass-through leaves are skipped below (forwarded)
+        kind = "while"
+      else:
+        pairs = list(_bh_alias_pairs(attrs))
+        kind = f"{opc}-alias"
+        if opc == "dynamic-update-slice":
+          pairs.append(((), 0, ()))
+          kind = "dus"
+        elif opc == "scatter":
+          n = (len(ops) - 1) // 2
+          pairs.extend([((), 0, ())] if n == 1 else [((i,), i, ()) for i in range(n)])
+          kind = "scatter"
+        elif opc == "fusion" and self.fused is not None:
+          m = _BH_CALLS_RE.search(attrs)
+          if m:
+            for (on, opath), outp in self.fused.pairs(m.group(1), tree):
+              pairs.append((outp, on, opath))
+            kind = "fusion-inplace"
+      for outp, on, opath in pairs:
+        if on >= len(ops):
+          continue
+        a = self.src(name, outp)
+        b = self.src(ops[on], opath)
+        if a[0] != name:
+          continue  # forwarded, not defined here
+        self._union(a, b)
+        why[a] = kind
+    return why
+
+  # -- edges ------------------------------------------------------------------
+  def edges(self):
+    """[(pred name, succ name, kind)] that hold in this (input) schedule, plus
+    the number of value pairs whose live ranges already conflict in it."""
+    why = self._alias_edges()
+    pos = self.pos
+    n = len(self.recs)
+    root_name = self.root
+    # params of this computation: the loop-carried buffer of a while body
+    params = [r[0] for r in self.recs if r[3] == "parameter"]
+    if root_name in self.by and len(params) == 1:
+      rr = self.recs[self.by[root_name]]
+      if rr[3] == "tuple":
+        for p in _bh_leaves(rr[2]):
+          a = self.src(root_name, p)
+          b = (params[0], p)
+          if a != b and a[0] in self.by:
+            self._union(a, b)
+            why.setdefault(a, "loop-carried")
+    # classes
+    members = {}
+    for k in list(self._parent.keys()):
+      members.setdefault(self._find(k), set()).add(k)
+    # readers of every value: (first pos, last pos, first inst, last inst)
+    readers = {}
+    for i, (name, is_root, tree, opc, ops, attrs) in enumerate(self.recs):
+      if opc in _BH_FORWARDING or opc == "parameter":
+        continue
+      if opc.endswith("-done") and opc not in _BH_NOT_ASYNC_DONE:
+        continue  # the start is the reader (until its done)
+      done = self.done_of.get(name)
+      last = done if done is not None else name
+      for o in ops:
+        oi = self.by.get(o)
+        if oi is None:
+          continue
+        for p in _bh_leaves(self.recs[oi][2]):
+          v = self.src(o, p)
+          readers.setdefault(v, []).append((name, last))
+    out, conflicts = [], 0
+    for cls, vals in members.items():
+      writers = {}
+      for v in vals:
+        w = v[0]
+        if w not in pos:
+          continue
+        writers.setdefault(w, []).append(v)
+      if len(writers) < 2:
+        continue
+      wl = sorted(writers, key=lambda w: pos[w])
+      for wb in wl:
+        rb = self.recs[pos[wb]]
+        wb_start = -1 if rb[3] == "parameter" else pos[wb]
+        if wb_start < 0:
+          continue
+        wb_done = self.done_of.get(wb)
+        kind_b = why.get(writers[wb][0], rb[3])
+        for wa in wl:
+          if wa == wb:
+            continue
+          ra = self.recs[pos[wa]]
+          a_is_param = ra[3] == "parameter"
+          # WAW
+          if not a_is_param and pos[wa] < pos[wb]:
+            a_end = self.done_of.get(wa, wa)
+            if pos[a_end] < wb_start:
+              out.append((a_end, wb, f"WAW {kind_b}"))
+            else:
+              conflicts += 1
+              self.conflict_examples.append(("WAW", wa, a_end, wb, kind_b))
+          # WAR
+          for v in writers[wa]:
+            for r0, r1 in readers.get(v, ()):
+              if r0 == wb or r1 == wb or (wb_done is not None and r1 == wb_done):
+                continue
+              if pos[r1] < wb_start:
+                out.append((r1, wb, f"WAR {kind_b} {'param' if a_is_param else ra[3]}"))
+              elif pos[r0] > (pos[wb_done] if wb_done else wb_start) and (a_is_param or pos[wa] < pos[wb]):
+                conflicts += 1  # reads the older value after the newer one was written
+                self.conflict_examples.append(("RAFTERW", wa, r0, wb, kind_b))
+    return list(dict.fromkeys(out)), conflicts
+
+
+def _bh_check(edges: list, pos: dict) -> list:
+  """Edges violated by the schedule positions `pos`."""
+  return [e for e in edges if e[0] in pos and e[1] in pos and pos[e[0]] > pos[e[1]]]
+
+
+# COLLECTIVE_OVERLAP_BUFFER_RULE: "1" (default) keep every buffer-sharing
+#   ordering (WAR/WAW edges of the section above) of the input schedule: the
+#   rewritten schedule is re-sorted with these edges where it violates one, and
+#   the final verify rejects any violation (fallback: input schedule). "0": off.
+_BUFFER_RULE = _env_flag("COLLECTIVE_OVERLAP_BUFFER_RULE", True)
+_COMP_HEADER_RE = re.compile(r"^(?:ENTRY )?%([\w.\-]+) ")
+
+
+def _computation_roots(module) -> dict:
+  """{computation name: ROOT instruction name}, from the module text (the
+  binding exposes no root accessor)."""
+  roots, cur = {}, None
+  for line in module.to_string().split("\n"):
+    if line.startswith("%") or line.startswith("ENTRY %"):
+      m = _COMP_HEADER_RE.match(line)
+      cur = m.group(1) if m else None
+    elif cur is not None and line.startswith("  ROOT %"):
+      roots[cur] = line[8:].split(" ", 1)[0]
+  return roots
+
+
+def _snapshot_buffers(module, schedule, module_name: str = "") -> dict:
+  """{computation name: [(pred, succ, kind)]} buffer-sharing edges of the
+  input schedule (see the buffer-rule section)."""
+  t0 = time.monotonic()
+  roots = _computation_roots(module)
+  comps = {c.name: c for c in module.computations()}
+  lines_memo: dict = {}
+
+  def get_lines(name):
+    if name in lines_memo:
+      return lines_memo[name]
+    c = comps.get(name)
+    got = None
+    if c is not None and name in roots:
+      got = ([i.to_string() for i in c.instructions()], roots[name])
+    lines_memo[name] = got
+    return got
+
+  fused = _BhFusedInfo(get_lines)
+  out, n_edges, n_conf = {}, 0, 0
+  for comp in module.make_nonfusion_computations():
+    seq = schedule.sequence(comp)
+    if seq is None or comp.name not in roots:
+      continue
+    seq = list(seq)
+    if len(seq) < 3:
+      continue
+    model = _BhModel([i.to_string() for i in seq], roots[comp.name], fused)
+    edges, conflicts = model.edges()
+    n_conf += conflicts
+    if edges:
+      out[comp.name] = edges
+      n_edges += len(edges)
+  _logger.info(
+      "gpu_collective_overlap_pass [%s]: buffer rule: %d ordering edges in %d computations "
+      "(%d input conflicts) in %.1f s.",
+      module_name,
+      n_edges,
+      len(out),
+      n_conf,
+      time.monotonic() - t0,
+  )
+  return out
+
+
+def _legalize(module, schedule, snap: dict, bsnap: dict, module_name: str) -> int:
+  """Re-sort computations that violate a buffer-sharing edge (bsnap), then
+  apply _COMM_RULE (snap). Every edge holds in the input schedule, so the
+  combined re-sort cannot cycle. Returns how many computations changed."""
+  changed = 0
+  for comp in module.make_nonfusion_computations():
+    ref = snap.get(comp.name) if _COMM_RULE != "off" else None
+    bedges = bsnap.get(comp.name) if _BUFFER_RULE else None
+    if ref is None and not bedges:
+      continue
+    seq = list(schedule.sequence(comp))
+    orig = seq
+    extra: dict = {}
+    n_buf = 0
+    if bedges:
+      for x, y, _ in bedges:
+        extra.setdefault(y, set()).add(x)
+      pos = {_iname(inst): i for i, inst in enumerate(seq)}
+      n_buf = len(_bh_check(bedges, pos))
+      if n_buf:
+        seq = _stable_resort(seq, extra)
+    n_fixed = 0
+    if ref is not None:
+      events, ipos, _, _ = ref
+      if _COMM_RULE == "order":
+        pos = {_iname(inst): i for i, inst in enumerate(seq)}
+        present = [n for n in events if n in pos]
+        if sorted(present, key=lambda n: pos[n]) != present:
+          for x, y in zip(present, present[1:]):
+            extra.setdefault(y, set()).add(x)
+          seq = _stable_resort(seq, extra)
+          n_fixed = len(present)
+      else:
+        for _ in range(_MAX_OVERLAP_LEGALIZE_ROUNDS):
+          pos = {_iname(inst): i for i, inst in enumerate(seq)}
+          bad = _new_comm_overlaps(ref, pos)
+          if not bad:
+            break
+          for (ts, td), (ns, nd, _) in bad:
+            # The pair was disjoint in the input: put it back on the same side.
+            if ipos[nd] < ipos[ts]:
+              extra.setdefault(ts, set()).add(nd)
+            else:
+              extra.setdefault(ns, set()).add(td)
+          n_fixed += len(bad)
+          seq = _stable_resort(seq, extra)
+        else:
+          raise RuntimeError(f"{comp.name}: te_ep/NCCL overlap legalization did not converge")
+    if seq is not orig and seq != orig:
+      schedule.set_sequence(comp, seq)
+      changed += 1
+      _logger.info(
+          "gpu_collective_overlap_pass [%s]: %s: buffer rule: restored %d buffer-sharing order(s); "
+          "rule '%s': separated %d te_ep x NCCL pair(s) (%d instructions moved).",
+          module_name,
+          comp.name,
+          n_buf,
+          _COMM_RULE,
+          n_fixed,
+          sum(1 for a, b in zip(seq, orig) if a is not b),
+      )
+  if changed:
+    schedule.update()
+    _clear_struct_caches()
+    schedule.verify()
+    module.set_schedule(schedule)
+  return changed
+
+
+def _verify_buffers(module, schedule, bsnap: dict) -> list:
+  """Buffer-sharing edges of the input that the final schedule violates."""
+  problems = []
+  if not _BUFFER_RULE:
+    return problems
+  for comp in module.make_nonfusion_computations():
+    edges = bsnap.get(comp.name)
+    if not edges:
+      continue
+    seq = schedule.sequence(comp)
+    if seq is None:
+      continue
+    pos = {_iname(inst): i for i, inst in enumerate(seq)}
+    for x, y, kind in _bh_check(edges, pos):
+      problems.append(f"{comp.name}: {kind}: {y} before {x} (buffer sharing)")
+  return problems
+
+
 def _compute_collective_overlap(serialized_hlo: bytes) -> Optional[bytes]:
   """Reorder the schedule using the PGLE profile. Runs on rank 0 only; see
   _gpu_collective_overlap_pass."""
@@ -3928,11 +4563,12 @@ def _compute_collective_overlap(serialized_hlo: bytes) -> Optional[bytes]:
   _log_profile_coverage_gaps(module, schedule, module_name)
 
   snap = _snapshot_comm(module, schedule) if (_COMM_RULE != "off" or _VERIFY_MODE != "0") else {}
+  bsnap = _snapshot_buffers(module, schedule, module_name) if _BUFFER_RULE else {}
   if not _reorder_to_fixed_point(module, schedule, module_name):
     return None
-  _legalize_comm(module, schedule, snap, module_name)
+  _legalize(module, schedule, snap, bsnap, module_name)
   if _VERIFY_MODE != "0":
-    problems = _verify_schedule(module, schedule, snap)
+    problems = _verify_schedule(module, schedule, snap) + _verify_buffers(module, schedule, bsnap)
     if problems:
       msg = (
           f"gpu_collective_overlap_pass [{module_name}]: rewritten schedule failed verification "
