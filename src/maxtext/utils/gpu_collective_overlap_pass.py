@@ -74,6 +74,7 @@ Call ``register()`` once before the first ``jax.jit``-compiled function runs.
 from __future__ import annotations
 
 import bisect
+import heapq
 
 import numpy as np
 import hashlib
@@ -3610,6 +3611,303 @@ def _reorder_to_fixed_point(module, schedule, module_name: str) -> bool:
   return changed
 
 
+# ---------------------------------------------------------------------------
+# te_ep x NCCL legalization and verification
+# ---------------------------------------------------------------------------
+# TransformerEngine pins its EP dispatch/combine calls (te_ep_*_ffi, async
+# call-starts with _xla_stream_annotation="collective") to XLA's collective
+# stream "so the scheduler serializes them with native collectives"
+# (transformer_engine/jax/cpp_extensions/ep.py, _on_collective_stream). The
+# latency-hiding scheduler honours that: in its schedule no te_ep window
+# [call-start, call-done] overlaps an NCCL collective window [start, done].
+# This pass only knows HLO data/control dependencies, so it moved NCCL starts
+# into te_ep windows; with several collective streams
+# (--xla_gpu_experimental_parallel_collective_overlap_limit) the two then run
+# concurrently, and the results are wrong (DSv4 serial GA4: loss drift from the
+# PGLE recompile on; jobs 3832021, 3834300).
+#
+# COLLECTIVE_OVERLAP_COMM_RULE selects how the rewritten schedule is legalized:
+#   "overlap" (default): no te_ep window may overlap an NCCL window unless the
+#       pair already overlapped in the input schedule. Pure order swaps that keep
+#       the two windows disjoint are kept (they stay serialized), so the pass
+#       keeps most of its reordering. Implemented as a stable topological re-sort
+#       (keeps the rewritten order wherever possible) with, for every offending
+#       pair, an edge that restores the input's side (NCCL done before te_ep start,
+#       or te_ep done before NCCL start); repeated until no offending pair is left.
+#   "order": patch 0003's strict rule: keep the input relative order of every
+#       te_ep and NCCL start/done.
+#   "off": no legalization (unsafe; experiments only).
+# COLLECTIVE_OVERLAP_COMM_ALLOW_SMALL_INPLACE_AR_BYTES=N (default 0 = off): with
+#   "overlap", also allow overlaps with in-place all-reduces whose operands total
+#   <= N bytes. Outside TE's contract; such overlaps were present in correct
+#   dual_pipe runs (8-node job 3830990, proxy), but are not proven safe.
+# COLLECTIVE_OVERLAP_VERIFY: "1" (default) check the final schedule (no
+#   use-before-def; the selected rule holds) and keep the input schedule if it
+#   fails; "raise": raise; "0": skip.
+# COLLECTIVE_OVERLAP_KEEP_COMM_ORDER=0 (0003's switch) still disables the
+#   legalization (same as COLLECTIVE_OVERLAP_COMM_RULE=off).
+_COMM_RULE = os.environ.get("COLLECTIVE_OVERLAP_COMM_RULE", "overlap").strip().lower()
+if not _env_flag("COLLECTIVE_OVERLAP_KEEP_COMM_ORDER", True):
+  _COMM_RULE = "off"
+if _COMM_RULE not in ("overlap", "order", "off"):
+  _COMM_RULE = "overlap"
+_ALLOW_SMALL_INPLACE_AR_BYTES = int(os.environ.get("COLLECTIVE_OVERLAP_COMM_ALLOW_SMALL_INPLACE_AR_BYTES", "0"))
+_MAX_OVERLAP_LEGALIZE_ROUNDS = 32
+_VERIFY_MODE = os.environ.get("COLLECTIVE_OVERLAP_VERIFY", "1").strip().lower()
+_NCCL_START_OPCODES = frozenset(
+    {
+        "all-gather-start",
+        "all-reduce-start",
+        "reduce-scatter-start",
+        "all-to-all-start",
+        "ragged-all-to-all-start",
+        "collective-permute-start",
+        "collective-broadcast-start",
+    }
+)
+_PRINTED_OPCODE_RE = re.compile(r"[}\])] ([a-z][a-z0-9-]*)\(")
+_SHAPE_BYTES = {"f8e4m3fn": 1, "f8e5m2": 1, "f8e8m0fnu": 1, "bf16": 2, "f16": 2, "f32": 4, "s32": 4, "u32": 4,
+                "s8": 1, "u8": 1, "pred": 1, "s64": 8, "u64": 8, "f64": 8, "s16": 2, "u16": 2}
+_SHAPE_RE = re.compile(r"\b([a-z0-9]+)\[([0-9,]*)\]")
+
+
+def _printed_opcode(inst) -> str:
+  """Opcode as printed in the instruction text (this binding reports every
+  async start as kAsyncStart; the text says all-reduce-start, call-start, ...)."""
+  text = inst.to_string()
+  _, sep, rest = text.partition(" = ")
+  m = _PRINTED_OPCODE_RE.search(rest if sep else text)
+  return m.group(1) if m else _opcode_str(inst)
+
+
+def _comm_kind(inst, comp_by_name: dict) -> Optional[str]:
+  """ "nccl" for an NCCL collective start, "te_ep" for a te_ep_* call start,
+  else None."""
+  if not _is_async_start(inst):
+    return None
+  if _printed_opcode(inst) in _NCCL_START_OPCODES:
+    return "nccl"
+  key = _resolve_profile_key(inst, comp_by_name)
+  if key.startswith(_TE_EP_PREFIX):
+    return "te_ep"
+  wrapped = _wrapped_custom_call_name(inst, comp_by_name)
+  if wrapped and wrapped.startswith(_TE_EP_PREFIX):
+    return "te_ep"
+  return None
+
+
+def _operand_bytes(inst) -> int:
+  total = 0
+  for op in _operands(inst):
+    text = op.to_string()
+    head = text.split(" = ", 1)[1] if " = " in text else text
+    head = head.split(")")[0] if head.startswith("(") else head.split(" ")[0]
+    for dt, dims in _SHAPE_RE.findall(head):
+      n = 1
+      for d in dims.split(","):
+        if d:
+          n *= int(d)
+      total += n * _SHAPE_BYTES.get(dt, 4)
+  return total
+
+
+def _nccl_overlap_allowed(inst) -> bool:
+  """Whether a te_ep window may overlap this NCCL collective under the
+  small-in-place-all-reduce allowance."""
+  if _ALLOW_SMALL_INPLACE_AR_BYTES <= 0:
+    return False
+  return (
+      _printed_opcode(inst) == "all-reduce-start"
+      and "output_to_operand_aliasing" in inst.to_string()
+      and _operand_bytes(inst) <= _ALLOW_SMALL_INPLACE_AR_BYTES
+  )
+
+
+def _comm_windows(seq: list, comp_by_name: dict) -> tuple:
+  """([te_ep (start, done) names], [nccl (start, done, allowed) names]) of seq."""
+  te, nccl = [], []
+  for inst in seq:
+    kind = _comm_kind(inst, comp_by_name)
+    if kind is None:
+      continue
+    users = list(inst.users())
+    if len(users) != 1:
+      continue
+    if kind == "te_ep":
+      te.append((_iname(inst), _iname(users[0])))
+    else:
+      nccl.append((_iname(inst), _iname(users[0]), _nccl_overlap_allowed(inst)))
+  return te, nccl
+
+
+def _snapshot_comm(module, schedule) -> dict:
+  """{computation name: (event names in input order, {name: input position},
+  te_ep windows, nccl windows)} for computations with te_ep and NCCL ops."""
+  comp_by_name = {c.name: c for c in module.computations()}
+  out = {}
+  for comp in module.make_nonfusion_computations():
+    seq = schedule.sequence(comp)
+    if seq is None:
+      continue
+    seq = list(seq)
+    te, nccl = _comm_windows(seq, comp_by_name)
+    if not te or not nccl:
+      continue
+    pos = {_iname(inst): i for i, inst in enumerate(seq)}
+    events = sorted({n for w in te for n in w[:2]} | {n for w in nccl for n in w[:2]}, key=lambda n: pos[n])
+    out[comp.name] = (events, pos, te, nccl)
+  return out
+
+
+def _windows_overlap(pos: dict, a: tuple, b: tuple) -> bool:
+  return pos[a[0]] < pos[b[1]] and pos[b[0]] < pos[a[1]]
+
+
+def _new_comm_overlaps(ref: tuple, pos: dict) -> list:
+  """(te window, nccl window) pairs overlapping in `pos` but not in the input,
+  excluding allowed NCCL ops."""
+  _, ipos, te, nccl = ref
+  out = []
+  for t in te:
+    if t[0] not in pos or t[1] not in pos:
+      continue
+    for n in nccl:
+      if n[2] or n[0] not in pos or n[1] not in pos:
+        continue
+      if _windows_overlap(pos, t, n) and not _windows_overlap(ipos, t, n):
+        out.append((t, n))
+  return out
+
+
+def _stable_resort(seq: list, extra_preds: dict) -> list:
+  """Topological order of seq over data/control deps plus extra_preds
+  ({name: set of names that must come first}), always taking the ready
+  instruction that sits earliest in seq."""
+  pos = {_iname(inst): i for i, inst in enumerate(seq)}
+  indeg = [0] * len(seq)
+  succ = [[] for _ in seq]
+  for i, inst in enumerate(seq):
+    preds = set()
+    for d in _operands(inst):
+      j = pos.get(_iname(d))
+      if j is not None:
+        preds.add(j)
+    for name in _control_predecessor_names(inst):
+      j = pos.get(name)
+      if j is not None:
+        preds.add(j)
+    for name in extra_preds.get(_iname(inst), ()):
+      j = pos.get(name)
+      if j is not None:
+        preds.add(j)
+    for j in preds:
+      succ[j].append(i)
+    indeg[i] = len(preds)
+  ready = [i for i in range(len(seq)) if indeg[i] == 0]
+  heapq.heapify(ready)
+  order = []
+  while ready:
+    i = heapq.heappop(ready)
+    order.append(i)
+    for k in succ[i]:
+      indeg[k] -= 1
+      if indeg[k] == 0:
+        heapq.heappush(ready, k)
+  if len(order) != len(seq):
+    raise RuntimeError("dependency cycle while legalizing te_ep/NCCL windows")
+  return [seq[i] for i in order]
+
+
+def _legalize_comm(module, schedule, snap: dict, module_name: str) -> int:
+  """Apply _COMM_RULE to every computation in snap; returns how many changed."""
+  if _COMM_RULE == "off":
+    return 0
+  changed = 0
+  for comp in module.make_nonfusion_computations():
+    ref = snap.get(comp.name)
+    if ref is None:
+      continue
+    events, ipos, _, _ = ref
+    seq = list(schedule.sequence(comp))
+    orig = seq
+    extra: dict = {}
+    if _COMM_RULE == "order":
+      pos = {_iname(inst): i for i, inst in enumerate(seq)}
+      present = [n for n in events if n in pos]
+      if sorted(present, key=lambda n: pos[n]) != present:
+        for x, y in zip(present, present[1:]):
+          extra.setdefault(y, set()).add(x)
+        seq = _stable_resort(seq, extra)
+      n_fixed = len(present) if seq is not orig else 0
+    else:
+      n_fixed = 0
+      for _ in range(_MAX_OVERLAP_LEGALIZE_ROUNDS):
+        pos = {_iname(inst): i for i, inst in enumerate(seq)}
+        bad = _new_comm_overlaps(ref, pos)
+        if not bad:
+          break
+        for (ts, td), (ns, nd, _) in bad:
+          # The pair was disjoint in the input: put it back on the same side.
+          if ipos[nd] < ipos[ts]:
+            extra.setdefault(ts, set()).add(nd)
+          else:
+            extra.setdefault(ns, set()).add(td)
+        n_fixed += len(bad)
+        seq = _stable_resort(seq, extra)
+      else:
+        raise RuntimeError(f"{comp.name}: te_ep/NCCL overlap legalization did not converge")
+    if seq is not orig and seq != orig:
+      schedule.set_sequence(comp, seq)
+      changed += 1
+      _logger.info(
+          "gpu_collective_overlap_pass [%s]: %s: rule '%s': separated %d te_ep x NCCL pair(s) "
+          "(%d instructions moved).",
+          module_name,
+          comp.name,
+          _COMM_RULE,
+          n_fixed,
+          sum(1 for a, b in zip(seq, orig) if a is not b),
+      )
+  if changed:
+    schedule.update()
+    _clear_struct_caches()
+    schedule.verify()
+    module.set_schedule(schedule)
+  return changed
+
+
+def _verify_schedule(module, schedule, snap: dict) -> list:
+  """Problems of the final schedule: use-before-def (operand or control
+  predecessor after its user) and violations of _COMM_RULE. Empty if legal."""
+  problems = []
+  for comp in module.make_nonfusion_computations():
+    seq = schedule.sequence(comp)
+    if seq is None:
+      continue
+    seq = list(seq)
+    pos = {_iname(inst): i for i, inst in enumerate(seq)}
+    for i, inst in enumerate(seq):
+      for d in _operands(inst):
+        j = pos.get(_iname(d))
+        if j is not None and j > i:
+          problems.append(f"{comp.name}: {_iname(inst)} uses {_iname(d)} before its definition")
+      for name in _control_predecessor_names(inst):
+        j = pos.get(name)
+        if j is not None and j > i:
+          problems.append(f"{comp.name}: {_iname(inst)} before its control predecessor {name}")
+    ref = snap.get(comp.name)
+    if ref is None or _COMM_RULE == "off":
+      continue
+    if _COMM_RULE == "order":
+      present = [n for n in ref[0] if n in pos]
+      if sorted(present, key=lambda n: pos[n]) != present:
+        problems.append(f"{comp.name}: te_ep/NCCL event order differs from the input")
+    else:
+      for (ts, _), (ns, _, _) in _new_comm_overlaps(ref, pos):
+        problems.append(f"{comp.name}: te_ep {ts} overlaps NCCL {ns}")
+  return problems
+
+
 def _compute_collective_overlap(serialized_hlo: bytes) -> Optional[bytes]:
   """Reorder the schedule using the PGLE profile. Runs on rank 0 only; see
   _gpu_collective_overlap_pass."""
@@ -3629,8 +3927,21 @@ def _compute_collective_overlap(serialized_hlo: bytes) -> Optional[bytes]:
 
   _log_profile_coverage_gaps(module, schedule, module_name)
 
+  snap = _snapshot_comm(module, schedule) if (_COMM_RULE != "off" or _VERIFY_MODE != "0") else {}
   if not _reorder_to_fixed_point(module, schedule, module_name):
     return None
+  _legalize_comm(module, schedule, snap, module_name)
+  if _VERIFY_MODE != "0":
+    problems = _verify_schedule(module, schedule, snap)
+    if problems:
+      msg = (
+          f"gpu_collective_overlap_pass [{module_name}]: rewritten schedule failed verification "
+          f"({len(problems)} problem(s), e.g. {problems[:5]})"
+      )
+      if _VERIFY_MODE == "raise":
+        raise RuntimeError(msg)
+      _logger.error("%s; keeping the input schedule.", msg)
+      return None
   _log_final_exposed_summary(module, schedule, module_name, "final")
   return module.as_serialized_hlo_module_proto()
 
