@@ -247,17 +247,19 @@ class OperandChainGuardTest(_PassTestCase):
   position; the trivial operand chain moved with it can leave an EP window."""
 
   def _build(self):
-    """EP window holding a trivial chain op (80 us) and filler (30 us) vs a 100 us
-    latency, an exposed all-gather after it, and a 150 us candidate whose
-    operand chain is that chain op."""
+    """An exposed all-gather, then an EP window holding a trivial chain op (80 us)
+    and filler (30 us) vs a 100 us latency, and a 150 us candidate whose operand
+    chain is that chain op. The chain sits after the all-gather, so filling the
+    all-gather window with the candidate has to move the chain out of the EP
+    window with it."""
     b = self.b
     prod = b.heavy("prod.0", 0.0)
+    ag_start, ag_done = b.all_gather(1, 200.0, [prod])
     ep_start, ep_done = b.te_ep(99, "te_ep_dispatch_ffi", 100.0, [prod])
     chain = b.trivial("loop_convert_fusion.1", 80.0, [prod])
     filler = b.heavy("filler.0", 30.0, [prod])
-    ag_start, ag_done = b.all_gather(1, 200.0, [prod])
     cand = b.heavy("candidate.0", 150.0, [chain])
-    seq = [prod, ep_start, chain, filler, ep_done, ag_start, ag_done, cand]
+    seq = [prod, ag_start, ag_done, ep_start, chain, filler, ep_done, cand]
     self.load_costs()
     return seq, ep_start, ep_done, chain, cand, ag_start
 
@@ -276,7 +278,7 @@ class OperandChainGuardTest(_PassTestCase):
     new_seq = self._fill(seq, guard=None)
     # The old behavior this guards against: the chain left the EP window.
     self.assertGreater(new_seq.index(cand), new_seq.index(ag_start))
-    self.assertGreater(new_seq.index(chain), new_seq.index(ep_done))
+    self.assertLess(new_seq.index(chain), new_seq.index(ep_start))
     self.assertLess(_window_overlap(new_seq, ep_start, ep_done, self.b.costs), 100.0)
 
   def test_window_mode_rejects_operand_chain_move(self):
@@ -300,7 +302,7 @@ class OperandChainGuardTest(_PassTestCase):
     guard = pass_lib._WindowGuard(_start_of_done(seq), self.b.comp_by_name, "region_161.228_spmd.1")
     new_seq = self._fill(seq, guard)
     self.assertGreater(new_seq.index(cand), new_seq.index(ag_start))
-    self.assertGreater(new_seq.index(chain), new_seq.index(ep_done))
+    self.assertLess(new_seq.index(chain), new_seq.index(ep_start))
     self.assertLess(new_seq.index(cand), new_seq.index(seq[seq.index(ag_start) + 2]))  # before ag done
     self.assertEqual(guard.rejections, 0)
     self.assertLess(_window_overlap(new_seq, ep_start, ep_done, self.b.costs), 100.0)

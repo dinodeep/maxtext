@@ -1261,10 +1261,31 @@ def _earliest_legal_pos(
 
 
 def _reinsert(seq: list, moving: list, at: int, last):
-  """seq without `moving`/`last`, with `moving` then `last` inserted at `at`."""
-  drop = set(moving) | {last}
-  new_seq = [inst for inst in seq if inst not in drop]
-  new_seq[at:at] = list(moving) + [last]
+  """seq with `last`, preceded by the members of `moving` that sit at or after
+  `at`, inserted at old index `at`.
+
+  Members of `moving` already before `at` stay where they are: they precede
+  the insertion point anyway, and moving them to `at` would put them after
+  their other users between their old position and `at` (callers pass a
+  target above the chain's floor, e.g. max(floor, window start + 1)), which
+  schedule.update() then "repairs" by reordering the computation. Indices are
+  old-sequence indices, so the insertion point accounts for removed
+  instructions that sat before it.
+  """
+  moving_set = set(moving)
+  stay = set()
+  dropped_before = 0
+  new_seq = []
+  for k, inst in enumerate(seq):
+    if inst is last or (inst in moving_set and k >= at):
+      if k < at:
+        dropped_before += 1
+      continue
+    if inst in moving_set:
+      stay.add(inst)
+    new_seq.append(inst)
+  at -= dropped_before
+  new_seq[at:at] = [m for m in moving if m not in stay] + [last]
   return new_seq
 
 
