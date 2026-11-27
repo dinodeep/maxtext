@@ -74,6 +74,8 @@ Call ``register()`` once before the first ``jax.jit``-compiled function runs.
 from __future__ import annotations
 
 import bisect
+
+import numpy as np
 import hashlib
 import logging
 import os
@@ -83,7 +85,57 @@ import socket
 import subprocess
 import sys
 import time
+from itertools import accumulate
 from typing import Optional
+
+# ---------------------------------------------------------------------------
+# Per-instruction memoization of pure structural queries (speed only; results
+# are unchanged). HloInstruction wrappers hash/compare by the underlying
+# instruction, so they key dicts directly; the caches are cleared before every
+# module and after every schedule.update() (which may rebuild sequences), so a
+# freed-and-reused instruction pointer can never hit a stale entry.
+# ---------------------------------------------------------------------------
+_struct_caches: list = []
+
+
+def _new_struct_cache() -> dict:
+  c: dict = {}
+  _struct_caches.append(c)
+  return c
+
+
+def _clear_struct_caches() -> None:
+  for c in _struct_caches:
+    c.clear()
+  _prefix_cache.clear()
+  _positions_cache.clear()
+  _inst_by_name.clear()
+
+
+_name_of = _new_struct_cache()
+_operands_of = _new_struct_cache()
+_cp_names_of = _new_struct_cache()
+_trivially_movable_of = _new_struct_cache()
+_profile_key_of = _new_struct_cache()
+_te_gemm_of = _new_struct_cache()
+_heavy_anchor_of = _new_struct_cache()
+_cost_of = _new_struct_cache()
+_opcode_of = _new_struct_cache()
+
+
+def _iname(inst) -> str:
+  n = _name_of.get(inst)
+  if n is None:
+    n = _name_of[inst] = inst.name
+    _inst_by_name[n] = inst
+  return n
+
+
+def _operands(inst) -> list:
+  ops = _operands_of.get(inst)
+  if ops is None:
+    ops = _operands_of[inst] = list(inst.operands())
+  return ops
 
 _logger = logging.getLogger(__name__)
 _logger.setLevel(logging.DEBUG)
@@ -361,6 +413,7 @@ def _select_module_costs(fingerprint: Optional[str], module_name: str) -> None:
   _profile_costs.clear()
   _wrapped_custom_call_cache.clear()
   _inst_cost_cache.clear()
+  _clear_struct_caches()
   _profile_costs.update(_pgle_costs_by_fingerprint.get(_UNFINGERPRINTED, {}))
   own = _pgle_costs_by_fingerprint.get(fingerprint, {}) if fingerprint else {}
   _profile_costs.update(own)
@@ -584,6 +637,13 @@ _opcode_str_cache: dict[str, str] = {}
 
 def _opcode_str(inst) -> str:
   """Hyphenated opcode string (e.g. "get-tuple-element") for an HloInstruction."""
+  s = _opcode_of.get(inst)
+  if s is None:
+    s = _opcode_of[inst] = _opcode_str_uncached(inst)
+  return s
+
+
+def _opcode_str_uncached(inst) -> str:
   name = inst.opcode.name
   s = _opcode_str_cache.get(name)
   if s is None:
@@ -653,6 +713,7 @@ def _register_host_offload_copies(module) -> None:
   _host_offload_copy_names.clear()
   _host_offload_copy_names.update(names)
   _inst_cost_cache.clear()
+  _clear_struct_caches()
   if names:
     _logger.info(
         "gpu_collective_overlap_pass [%s]: registered %d host-offload copy instruction(s) (starts and dones): %s",
@@ -784,6 +845,13 @@ def _is_trivial_fusion_body(inst, comp_by_name: dict) -> bool:
 
 def _is_trivially_movable_inst(inst, comp_by_name: dict) -> bool:
   """True if inst can be relocated without moving real compute."""
+  r = _trivially_movable_of.get(inst)
+  if r is None:
+    r = _trivially_movable_of[inst] = _is_trivially_movable_inst_uncached(inst, comp_by_name)
+  return r
+
+
+def _is_trivially_movable_inst_uncached(inst, comp_by_name: dict) -> bool:
   opc = _opcode_str(inst)
   if opc in _TRIVIAL_SINGLE_OPCODES:
     return True
@@ -794,6 +862,13 @@ def _is_trivially_movable_inst(inst, comp_by_name: dict) -> bool:
 
 # TODO tixxx, remove this once control_predecessors is exposed through python binding.
 def _control_predecessor_names(inst) -> list[str]:
+  r = _cp_names_of.get(inst)
+  if r is None:
+    r = _cp_names_of[inst] = tuple(_control_predecessor_names_uncached(inst))
+  return list(r)
+
+
+def _control_predecessor_names_uncached(inst) -> list[str]:
   try:
     text = inst.to_string()
   except Exception:
@@ -865,6 +940,13 @@ def _resolve_profile_key(async_start, comp_by_name: dict) -> str:
   te_ep call-starts use to_apply=%name instead (async_wrapped_root() fails or
   returns an intermediate "call.N"), so fall back to parsing it.
   """
+  key = _profile_key_of.get(async_start)
+  if key is None:
+    key = _profile_key_of[async_start] = _resolve_profile_key_uncached(async_start, comp_by_name)
+  return key
+
+
+def _resolve_profile_key_uncached(async_start, comp_by_name: dict) -> str:
   root = None
   try:
     root = async_start.async_wrapped_root()
@@ -993,14 +1075,20 @@ def _wraps_custom_call(inst, target_re, comp_by_name: dict) -> bool:
 def _is_te_gemm_custom_call(inst, comp_by_name: dict) -> bool:
   """te_grouped_gemm/te_gemm kernel (the MoE GEMMs that dominate compute);
   prioritized when filling async collective windows."""
-  return _wraps_custom_call(inst, _TE_GEMM_TARGET_RE, comp_by_name)
+  r = _te_gemm_of.get(inst)
+  if r is None:
+    r = _te_gemm_of[inst] = _wraps_custom_call(inst, _TE_GEMM_TARGET_RE, comp_by_name)
+  return r
 
 
 def _is_heavy_anchor_custom_call(inst, comp_by_name: dict) -> bool:
   """te_gemm/cudnn/cublas kernel: where _chase_async_start_blocker_toward_heavy_compute
   stops. Broader than _is_te_gemm_custom_call, kept separate so this chase
   path doesn't change the validated fill priority."""
-  return _wraps_custom_call(inst, _HEAVY_ANCHOR_TARGET_RE, comp_by_name)
+  r = _heavy_anchor_of.get(inst)
+  if r is None:
+    r = _heavy_anchor_of[inst] = _wraps_custom_call(inst, _HEAVY_ANCHOR_TARGET_RE, comp_by_name)
+  return r
 
 
 # Async collectives the reorder treats as relocatable; all-reduce is handled like all-gather/reduce-scatter.
@@ -1023,9 +1111,13 @@ _inst_cost_cache: dict[str, float] = {}
 
 def _resolve_inst_cost(inst, comp_by_name: dict) -> float:
   """Profiled cost (us) of inst (cached, see _inst_cost_cache)."""
-  c = _inst_cost_cache.get(inst.name)
+  c = _cost_of.get(inst)
   if c is None:
-    c = _inst_cost_cache[inst.name] = _resolve_inst_cost_uncached(inst, comp_by_name)
+    name = _iname(inst)
+    c = _inst_cost_cache.get(name)
+    if c is None:
+      c = _inst_cost_cache[name] = _resolve_inst_cost_uncached(inst, comp_by_name)
+    _cost_of[inst] = c
   return c
 
 
@@ -1063,11 +1155,28 @@ def _resolve_inst_cost_uncached(inst, comp_by_name: dict) -> float:
 
 def _prefix_costs_excluding(seq: list, exclude: set, comp_by_name: dict) -> list:
   """Prefix sum of costs along `seq`, with `exclude`d instructions counted as 0."""
-  prefix = [0.0] * (len(seq) + 1)
-  for i, inst in enumerate(seq):
-    c = 0.0 if inst in exclude else _resolve_inst_cost(inst, comp_by_name)
-    prefix[i + 1] = prefix[i] + c
+  # Same left-to-right float additions as a running sum, so bit-identical.
+  if not exclude:
+    # Sequences are never mutated in place once built (the window guard relies
+    # on the same identity caching), so the last few results are reused by identity.
+    for cached_seq, cached_prefix in _prefix_cache:
+      if cached_seq is seq:
+        return cached_prefix
+  get = _cost_of.get
+  if exclude:
+    costs = [0.0 if inst in exclude else (get(inst) if inst in _cost_of else _resolve_inst_cost(inst, comp_by_name))
+             for inst in seq]
+  else:
+    costs = [c if (c := get(inst)) is not None else _resolve_inst_cost(inst, comp_by_name) for inst in seq]
+  prefix = list(accumulate(costs, initial=0.0))
+  if not exclude:
+    _prefix_cache[:] = [(seq, prefix)] + _prefix_cache[:3]
   return prefix
+
+
+# (seq, prefix) of the most recent exclude-free _prefix_costs_excluding calls;
+# emptied with the other structural caches.
+_prefix_cache: list = []
 
 
 def _total_exposed_us(
@@ -1117,7 +1226,7 @@ def _earliest_legal_pos(
   seen: set = set()
   floor = 0
   blocker = None
-  queue = list(async_start.operands())
+  queue = list(_operands(async_start))
   while queue:
     inst = queue.pop()
     if inst in seen:
@@ -1127,13 +1236,13 @@ def _earliest_legal_pos(
       continue
     if len(candidates) < _MAX_RELOCATE_CHAIN and _is_trivially_movable_inst(inst, comp_by_name):
       candidates.add(inst)
-      queue.extend(inst.operands())
+      queue.extend(_operands(inst))
     else:
       if positions[inst] + 1 > floor:
         floor = positions[inst] + 1
         blocker = inst
 
-  moving_names = {inst.name for inst in candidates} | {async_start.name}
+  moving_names = {_iname(inst) for inst in candidates} | {_iname(async_start)}
   for inst in list(candidates) + [async_start]:
     for name in _control_predecessor_names(inst):
       if name in moving_names:
@@ -1162,9 +1271,40 @@ def _reinsert(seq: list, moving: list, at: int, last):
 def _commit_sequence(schedule, comp, new_seq: list):
   """Set comp's sequence; returns (seq, positions, name_to_pos)."""
   schedule.set_sequence(comp, new_seq)
-  positions = {inst: i for i, inst in enumerate(new_seq)}
-  name_to_pos = {inst.name: i for inst, i in positions.items()}
-  return new_seq, positions, name_to_pos
+  positions = _positions_of(new_seq)
+  return new_seq, positions, _NameToPos(positions)
+
+
+def _positions_of(seq: list) -> dict:
+  """{inst: index} of `seq`, reused by identity for the most recent sequences
+  (sequences are never mutated in place once built)."""
+  for cached_seq, cached in _positions_cache:
+    if cached_seq is seq:
+      return cached
+  positions = {inst: i for i, inst in enumerate(seq)}
+  _positions_cache[:] = [(seq, positions)] + _positions_cache[:3]
+  return positions
+
+
+_positions_cache: list = []
+# Instruction by name, for every instruction _iname has named.
+_inst_by_name: dict = {}
+
+
+class _NameToPos:
+  """Read-only {instruction name: index} view over a positions dict, instead of
+  a second O(n) dict per committed move. Only .get() is used."""
+
+  __slots__ = ("_positions",)
+
+  def __init__(self, positions: dict):
+    self._positions = positions
+
+  def get(self, name, default=None):
+    inst = _inst_by_name.get(name)
+    if inst is None:
+      return default
+    return self._positions.get(inst, default)
 
 
 def _relocate_async_done_before_te_ep(
@@ -1696,7 +1836,7 @@ def _compute_position_margins(
   """
   if prefix is None:
     prefix = _prefix_costs_excluding(seq, (), comp_by_name)
-  margins: dict[int, float] = {}
+  margins = _PositionMargins(len(seq))
   for async_done, async_start in start_of_done.items():
     if async_start not in positions or async_done not in positions:
       continue
@@ -1707,10 +1847,27 @@ def _compute_position_margins(
     if d <= s + 1 or d <= min_pos:
       continue
     slack = prefix[d] - prefix[s + 1] - latency
-    for p in range(max(s + 1, min_pos), d):
-      if p not in margins or slack < margins[p]:
-        margins[p] = slack
+    margins.cover(max(s + 1, min_pos), d, slack)
   return margins
+
+
+class _PositionMargins:
+  """{position: min slack of the windows covering it} with only .get(), as a
+  float64 array (exact for Python floats) min-updated per window slice
+  instead of a per-position dict loop. Uncovered positions read as `default`."""
+
+  def __init__(self, n: int):
+    self._arr = np.full(max(n, 1), np.inf)
+    self._covered = np.zeros(max(n, 1), dtype=bool)
+
+  def cover(self, lo: int, hi: int, slack: float) -> None:
+    np.minimum(self._arr[lo:hi], slack, out=self._arr[lo:hi])
+    self._covered[lo:hi] = True
+
+  def get(self, p, default=None):
+    if 0 <= p < len(self._arr) and self._covered[p]:
+      return float(self._arr[p])
+    return default
 
 
 # COLLECTIVE_OVERLAP_WINDOW_GUARD=0 disables the window guard (_WindowGuard):
@@ -1799,11 +1956,8 @@ class _WindowGuard:
     for cached_seq, state in self._cache:
       if cached_seq is seq:
         return state
-    name_pos = {}
-    prefix = [0.0] * (len(seq) + 1)
-    for i, inst in enumerate(seq):
-      name_pos[inst.name] = i
-      prefix[i + 1] = prefix[i] + self._inst_cost(inst)
+    name_pos = _NameToPos(_positions_of(seq))
+    prefix = _prefix_costs_excluding(seq, (), self.comp_by_name)
     overlaps = {}
     for s, d, _ in self.windows:
       sp, dp = name_pos.get(s.name), name_pos.get(d.name)
@@ -2474,7 +2628,7 @@ def _fill_exposed_collectives_best_of(
         comp,
         start_of_done,
         dict(positions),
-        dict(name_to_pos),
+        name_to_pos,
         comp_by_name,
         module_name,
         give_up_mode=cached_mode,
@@ -2497,7 +2651,7 @@ def _fill_exposed_collectives_best_of(
 
   baseline_seq = list(seq)
   baseline_positions = dict(positions)
-  baseline_name_to_pos = dict(name_to_pos)
+  baseline_name_to_pos = name_to_pos
 
   best: Optional[tuple] = None  # (total_exposed, changed, seq, positions, name_to_pos, mode, pins)
   for mode in _GIVE_UP_MODES:
@@ -2510,7 +2664,7 @@ def _fill_exposed_collectives_best_of(
         comp,
         start_of_done,
         dict(baseline_positions),
-        dict(baseline_name_to_pos),
+        baseline_name_to_pos,
         comp_by_name,
         module_name,
         give_up_mode=mode,
@@ -2994,6 +3148,8 @@ def _reorder_collectives(module, schedule, module_name: str) -> bool:
     if _WHILE_BODY_ONLY and not is_while_body:
       continue
     seq = list(schedule.sequence(comp))
+    for inst in seq:  # name every instruction once, for the _NameToPos views
+      _iname(inst)
 
     start_of_done: dict = {}
     for inst in seq:
@@ -3342,9 +3498,20 @@ def _restore_schedule(module, schedule, seqs: dict, module_name: str) -> bool:
   for comp, seq in new:
     schedule.set_sequence(comp, seq)
   schedule.update()
+  _clear_struct_caches()
   schedule.verify()
   module.set_schedule(schedule)
   return True
+
+
+def _schedule_names(module, schedule) -> dict:
+  """{computation name: instruction names in schedule order}."""
+  out = {}
+  for comp in module.make_nonfusion_computations():
+    seq = schedule.sequence(comp)
+    if seq is not None:
+      out[comp.name] = [inst.name for inst in seq]
+  return out
 
 
 def _reorder_to_fixed_point(module, schedule, module_name: str) -> bool:
@@ -3360,15 +3527,31 @@ def _reorder_to_fixed_point(module, schedule, module_name: str) -> bool:
   _fill_strategy_cache = {}
   _window_fill_pins.clear()
   _inst_cost_cache.clear()
+  _clear_struct_caches()
   changed = False
   best = _snapshot_schedule(module, schedule, module_name, "input") if _KEEP_BEST_ITERATION else None
+  prev_seqs = None
   for it in range(_MAX_REORDER_ITERS):
     if not _reorder_collectives(module, schedule, module_name):
       break
     changed = True
     schedule.update()
+    _clear_struct_caches()
     schedule.verify()
     module.set_schedule(schedule)
+    # An iteration is a deterministic function of the schedule (the fill
+    # strategies are fixed after the first one), so once update() hands back
+    # the same schedule as after the previous iteration every further
+    # iteration, and the final pass, would reproduce it: stop now (same output).
+    cur_seqs = _schedule_names(module, schedule)
+    if cur_seqs == prev_seqs:
+      _logger.info(
+          "gpu_collective_overlap_pass [%s]: iteration %d left the schedule unchanged; stopping.",
+          module_name,
+          it + 1,
+      )
+      break
+    prev_seqs = cur_seqs
     if best is not None:
       snap = _snapshot_schedule(module, schedule, module_name, f"iteration {it + 1}")
       if snap[0] < best[0] - 1e-6:
@@ -3384,6 +3567,7 @@ def _reorder_to_fixed_point(module, schedule, module_name: str) -> bool:
     if _reorder_collectives(module, schedule, module_name):
       changed = True
       schedule.update()
+      _clear_struct_caches()
       schedule.verify()
       module.set_schedule(schedule)
   if best is not None and changed:
@@ -3399,6 +3583,7 @@ def _reorder_to_fixed_point(module, schedule, module_name: str) -> bool:
   if _hoist_host_offload_copy_starts(module, schedule, module_name):
     changed = True
     schedule.update()
+    _clear_struct_caches()
     schedule.verify()
     module.set_schedule(schedule)
   return changed
